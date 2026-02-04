@@ -10,7 +10,7 @@ The `Dockerfile` shows how to install all the dependencies (mostly python packag
 For example, try running:
 
 ```
-python3 -m nnenum.nnenum examples/acasxu/data/ACASXU_run2a_3_3_batch_2000.onnx examples/acasxu/data/prop_9.vnnlib
+python3 -m nnenum.nnenum -o examples/acasxu/data/ACASXU_run2a_3_3_batch_2000.onnx -v examples/acasxu/data/prop_9.vnnlib
 ```
 
 You can see a few more examples in `run_tests.sh`.

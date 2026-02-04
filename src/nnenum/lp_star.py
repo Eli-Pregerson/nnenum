@@ -6,10 +6,6 @@ Stanley Bak
 
 import numpy as np
 from nnenum.settings import Settings
-if Settings.LP_SOLVER == 'GLPK':
-    from nnenum.lpinstance_glpk import LpInstanceGLPK as LpInstance
-else:
-    from nnenum.lpinstance_gb import LpInstanceGB as LpInstance
 # from nnenum.lpinstance import LpInstance
 from nnenum.util import Freezable
 from nnenum.settings import Settings
@@ -28,6 +24,11 @@ class LpStar(Freezable):
     def __init__(self, a_mat, bias, box_bounds=None):
         assert a_mat is None or isinstance(a_mat, np.ndarray)
         assert bias is None or isinstance(bias, np.ndarray)
+
+        if Settings.LP_SOLVER == 'GLPK':
+            from nnenum.lpinstance_glpk import LpInstanceGLPK as LpInstance
+        else:
+            from nnenum.lpinstance_gb import LpInstanceGB as LpInstance
         
         self.a_mat = a_mat
         self.bias = bias
@@ -94,6 +95,11 @@ class LpStar(Freezable):
 
     def copy(self):
         'return a copy of this lpstar'
+
+        if Settings.LP_SOLVER == 'GLPK':
+            from nnenum.lpinstance_glpk import LpInstanceGLPK as LpInstance
+        else:
+            from nnenum.lpinstance_gb import LpInstanceGB as LpInstance
 
         rv = LpStar(a_mat=self.a_mat.copy(), bias=self.bias.copy())
 

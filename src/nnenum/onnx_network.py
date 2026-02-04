@@ -231,8 +231,8 @@ class LinearOnnxSubnetworkLayer(Freezable):
         deeppoly.ubconst = updated_ubconst_nl
         deeppoly.lbcoef = updated_lbcoef_nl
         deeppoly.lbconst = updated_lbconst_nl
-        np.save(f'deeppoly.ubcoef_{self.layer_num}_lg.npy', deeppoly.ubcoef)
-        print(f'deeppoly.ubcoef.shape: {deeppoly.ubcoef.shape}')
+        # np.save(f'deeppoly.ubcoef_{self.layer_num}_lg.npy', deeppoly.ubcoef)
+        # print(f'deeppoly.ubcoef.shape: {deeppoly.ubcoef.shape}')
 
         deeppoly.ubs = np.where(deeppoly.ubcoef >= 0, deeppoly.ubcoef, 0) @ deeppoly.inputbounds[:, 1]
         deeppoly.ubs += np.where(deeppoly.ubcoef < 0, deeppoly.ubcoef, 0) @ deeppoly.inputbounds[:, 0]

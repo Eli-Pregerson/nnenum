@@ -288,3 +288,99 @@ def read_vnnlib_simple(vnnlib_filename, num_inputs, num_outputs):
         
     return final_rv
 
+
+
+def read_io_vnnlib(vnnlib_filename, num_inputs, num_outputs):
+    '''process in a vnnlib file of 'LinearizeNN_benchmark2024'
+
+    this is not a general parser, and assumes files are provided in a 'nice' format. Only a single disjunction
+    is allowed
+
+    output a list containing 2-tuples:
+        1. input ranges (box), list of pairs for each input variable
+        2. specification, provided as a list of pairs (mat, rhs), as in: mat * y <= rhs, where y is the output. 
+                          Each element in the list is a term in a disjunction for the specification.
+    '''
+
+    with open(vnnlib_filename, 'r') as file:
+        lines = file.readlines()
+
+    input_constraints = {
+        "X_0": [None, None],
+        "X_1": [None, None],
+        "X_2": [None, None],
+        "X_3": [None, None]
+    }
+
+    input_bounds = [
+        [None, None],
+        [None, None],
+        [None, None],
+        [None, None]
+    ]
+
+    for line in lines:
+        if "(assert (<= X_" in line or "(assert (>= X_" in line:
+            parts = line.split()
+            var_name = parts[2]
+            var_idx = int(var_name[2])
+            bound = float(parts[3].rstrip(')'))
+            if "<=" in line:
+                # input_constraints[var_name][1] = bound
+                input_bounds[var_idx][1] = bound
+            elif ">=" in line:
+                # input_constraints[var_name][0] = bound
+                input_bounds[var_idx][0] = bound
+
+    init_box = np.array(input_bounds, dtype=np.float32)
+
+    output_constraints = {
+        "before_X_2": [],
+        "before_X_3": [],
+        "between_and_X2_X3": [],
+        "between_X3_end": [],
+        "between_and_greater_X2_X3": []
+    }
+
+    capture = False
+
+    for line in lines:
+        if "; Output constraints:" in line:
+            capture = True
+            continue
+        if capture:
+            if line.strip() == "":
+                break
+            if "X_2" in line:
+                match = re.search(r'([-\d\.]+)\s+X_2', line)
+                if match:
+                    output_constraints["before_X_2"].append(float(match.group(1)))
+
+            if "X_3" in line:
+                match = re.search(r'([-\d\.]+)\s+X_3', line)
+                if match:
+                    output_constraints["before_X_3"].append(float(match.group(1)))
+                
+            if "(and (<= (" in line and " (- Y_0" in line:
+                match = re.search(r'\(and \(<= \(\s*([-\d\.]+)', line)
+                if match:
+                    output_constraints["between_and_X2_X3"].append(float(match.group(1)))
+                
+            if " X_3) " in line and ")))))" in line:
+                match = re.search(r'X_3\)\s+([-\d\.]+)', line)
+                if match:
+                    output_constraints["between_X3_end"].append(float(match.group(1)))
+                    
+            if "(and (>= (" in line and " (- Y_0" in line:
+                match = re.search(r'\(and \(>= \(\s*([-\d\.]+)', line)
+                if match:
+                    output_constraints["between_and_greater_X2_X3"].append(float(match.group(1)))
+
+    normalize_models_slope = [output_constraints["before_X_2"][0], output_constraints["before_X_3"][0]]
+    models_intercept = output_constraints["between_X3_end"][0]
+    model_range = [output_constraints["between_and_greater_X2_X3"][0], output_constraints["between_and_X2_X3"][0]]
+
+    return init_box, normalize_models_slope, models_intercept, model_range
+
+
+

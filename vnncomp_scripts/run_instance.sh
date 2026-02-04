@@ -24,8 +24,27 @@ echo "Running $TOOL_NAME on benchmark instance in category '$CATEGORY' with onnx
 DIR=$(dirname $(dirname $(realpath $0)))
 export PYTHONPATH="$PYTHONPATH:$DIR/src"
 
+# export PATH=${PATH}:$HOME/miniconda/bin
+
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 
 # run the tool to produce the results file
-python3 -m nnenum.nnenum "$ONNX_FILE" "$VNNLIB_FILE" "$TIMEOUT" "$RESULTS_FILE"
+####conda####
+# conda_path = ${HOME}/anaconda3/bin
+# py_pip_path = ${HOME}/anaconda3/bin
+
+# conda_path = ${HOME}/miniconda/bin
+# py_pip_path = ${HOME}/miniconda/envs/nnenumenv/bin # path for python, pip, grbprobe
+# ${HOME}/anaconda3/envs/nnenumenv/bin/python -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"
+${HOME}/miniconda/envs/nnenumenv/bin/python -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"
+
+
+####pipenv####
+# export PATH="/root/.local/share/virtualenvs/toolkit-Z_JSe2nD/bin:$PATH"
+# cd $DIR
+# pipenv run python -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"
+
+
+####pip####
+# python3 -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"

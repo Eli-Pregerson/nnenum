@@ -841,7 +841,7 @@ class DeeppolyOverapprox(Freezable):
         for i, row in enumerate(updated_lbcoef_nl):
             if min_vals[i] > spec.rhs[i]:
                 might_violate = False
-                print('verified by deeppoly')
+                # print('verified by deeppoly')
                 return not might_violate
         return not might_violate
         

@@ -259,6 +259,11 @@ class FlattenLayer(Freezable):
 
         # do nothing
 
+    def transform_deeppoly(self, deeppoly):
+        'transform the deeppoly for this layer'
+
+        # do nothing
+
     def execute(self, state):
         '''execute the layer on a concrete state
  

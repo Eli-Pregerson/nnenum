@@ -1,0 +1,9 @@
+name: nnenum
+ami: ami-0892d3c7ee96c0bf7
+scripts_dir: vnncomp_scripts
+manual_installation_step: true
+run_installation_script_as_root: false
+run_post_installation_script_as_root: false
+run_toolkit_as_root: false
+description: >
+  nnenum (pronounced en-en-en-um) is a high-performance neural network verification tool. Multiple levels of abstraction are used to quickly verify ReLU networks without sacrificing completeness. Analysis combines three types of zonotopes and deeppoly with star set (triangle) overapproximations.

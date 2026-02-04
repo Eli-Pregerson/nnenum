@@ -18,6 +18,29 @@ VNNLIB_FILE=$4
 
 echo "Preparing $TOOL_NAME for benchmark instance in category '$CATEGORY' with onnx file '$ONNX_FILE' and vnnlib file '$VNNLIB_FILE'"
 
+# setup environment variable for tool (doing it earlier won't be persistent with docker)"
+DIR=$(dirname $(dirname $(realpath $0)))
+export PYTHONPATH="$PYTHONPATH:$DIR/src"
+
+# run maxpool conversion
+
+###conda###
+# conda_path = ${HOME}/anaconda3/bin
+# py_pip_path = ${HOME}/anaconda3/bin
+
+# conda_path = ${HOME}/miniconda/bin
+# py_pip_path = ${HOME}/miniconda/envs/nnenumenv/bin # path for python, pip, grbprobe
+# conda activate nnenumenv
+# ${HOME}/miniconda/bin/conda activate nnenumenv
+# ${HOME}/anaconda3/envs/nnenumenv/bin/python -m nnenum.convert_maxpool "$ONNX_FILE"
+${HOME}/miniconda/envs/nnenumenv/bin/python -m nnenum.convert_maxpool "$ONNX_FILE"
+
+###pipenv###
+# pipenv run python -m nnenum.convert_maxpool "$ONNX_FILE"
+
+###pip###
+# python3 -m nnenum.convert_maxpool "$ONNX_FILE"
+
 # kill any zombie processes
 killall -q python3
 
