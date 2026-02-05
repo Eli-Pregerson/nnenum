@@ -37,7 +37,7 @@ export OMP_NUM_THREADS=1
 # conda_path = ${HOME}/miniconda/bin
 # py_pip_path = ${HOME}/miniconda/envs/nnenumenv/bin # path for python, pip, grbprobe
 # ${HOME}/anaconda3/envs/nnenumenv/bin/python -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"
-${HOME}/miniconda/envs/nnenumenv/bin/python -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"
+python -m nnenum.nnenum -o "$ONNX_FILE" -v "$VNNLIB_FILE" -t "$TIMEOUT" -f "$RESULTS_FILE" -s "$CATEGORY"
 
 
 ####pipenv####
