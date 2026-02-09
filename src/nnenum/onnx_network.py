@@ -9,6 +9,7 @@ from scipy.sparse import csc_matrix, csr_matrix
 from scipy import sparse
 
 import onnx
+from onnx import version_converter
 import onnxruntime as ort
 
 from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_model_inputs_outputs
@@ -31,12 +32,17 @@ class LinearOnnxSubnetworkLayer(Freezable):
         self.layer_num = layer_num
         self.network = None # populated later when constructing network
 
+        # Ensure opset is 23 (submodel extraction may not preserve converted opset)
+        for opset in onnx_submodel.opset_import:
+            if opset.domain in ['', 'ai.onnx'] and opset.version > 23:
+                opset.version = 23
+
         initializers = [i.name for i in onnx_submodel.graph.initializer]
         inputs = [i for i in onnx_submodel.graph.input if i.name not in initializers]
-    
+
         assert len(inputs) == 1
         assert len(onnx_submodel.graph.output) == 1
-                
+
         self.input_name = inputs[0].name
 
         #print(onnx_submodel)
@@ -334,6 +340,11 @@ def load_onnx_network_optimized(filename):
     '''
 
     model = onnx.load(filename)
+
+    # Convert to opset 23 if needed (opset 25+ is not fully supported by onnxruntime)
+    if any(opset.version > 23 for opset in model.opset_import):
+        model = version_converter.convert_version(model, 23)
+
     onnx.checker.check_model(model)
 
     graph = model.graph
@@ -795,7 +806,12 @@ def get_io_shapes(model):
     # this model is not a valud model since the outputs don't have shape type info...
     # but it still will execute! skip the check_model step
     new_onnx_model = make_model_with_graph(model, graph, check_model=False)
-    
+
+    # Ensure opset is 23 (make_model_with_graph may create inconsistent state)
+    for opset in new_onnx_model.opset_import:
+        if opset.domain in ['', 'ai.onnx'] and opset.version > 23:
+            opset.version = 23
+
     sess = ort.InferenceSession(new_onnx_model.SerializeToString())
 
     res = sess.run(None, input_map)
@@ -846,6 +862,11 @@ def load_onnx_network(filename):
     '''
 
     model = onnx.load(filename)
+
+    # Convert to opset 23 if needed (opset 25+ is not fully supported by onnxruntime)
+    if any(opset.version > 23 for opset in model.opset_import):
+        model = version_converter.convert_version(model, 23)
+
     onnx.checker.check_model(model)
 
     passes = ["extract_constant_to_initializer", "eliminate_unused_initializer"]
