@@ -15,7 +15,7 @@ import onnxruntime as ort
 from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_model_inputs_outputs
 from onnx.helper import ValueInfoProto, make_graph, make_model
 
-from nnenum.network import NeuralNetwork, AddLayer, FlattenLayer, ReluLayer, MatMulLayer, FullyConnectedLayer
+from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
@@ -276,6 +276,26 @@ def find_node_with_input(graph, input_name):
 
     return rv
 
+def find_node_with_output(graph, output_name):
+    'find the onnx node with the given output, can return None'
+
+    for n in graph.node:
+        for o in n.output:
+            if o == output_name:
+                return n
+
+    return None
+
+def parse_onnx_int_tensor(data_type, raw_data):
+    'parse an ONNX integer tensor from raw bytes, returns numpy array'
+
+    if data_type == 7:  # INT64
+        return np.frombuffer(raw_data, dtype='<i8')  # little endian int64
+    elif data_type == 2:  # INT32
+        return np.frombuffer(raw_data, dtype='<i4')  # little endian int32
+    else:
+        assert False, f"Unsupported integer data type: {data_type}"
+
 def convert_model_type_unused(model, from_type=onnx.TensorProto.FLOAT, to_type=onnx.TensorProto.DOUBLE, check_model=True):
     'convert a float32 model to a float64 one'
 
@@ -423,6 +443,26 @@ def load_onnx_network_optimized(filename):
                 b = -1 * b
 
             layer = AddLayer(len(layers), b)
+        elif op == 'Constant':
+            # Extract constant value from node's 'value' attribute
+            value_attr = None
+            for attr in cur_node.attribute:
+                if attr.name == 'value':
+                    value_attr = attr
+                    break
+
+            assert value_attr is not None, "Constant node must have 'value' attribute"
+
+            # Get tensor from attribute
+            const_tensor = value_attr.t
+            assert const_tensor.data_type == onnx_type_float, "Constant must be float type"
+
+            # Extract value
+            value = np.frombuffer(const_tensor.raw_data, dtype='<f4')  # little endian float32
+            shape = tuple(d for d in const_tensor.dims)
+            value = nn_unflatten(value, shape, order='F')
+
+            layer = ConstantLayer(len(layers), value)
         elif op == 'Flatten':
             assert cur_node.attribute[0].i == 1 # flatten along columns
 
@@ -475,6 +515,37 @@ def load_onnx_network_optimized(filename):
                     weight_mat = weight_mat.transpose().copy()
 
             layer = FullyConnectedLayer(len(layers), weight_mat, bias_vec, prev_shape)
+        elif op == 'Reshape':
+            assert len(cur_node.input) == 2, "Reshape should have 2 inputs (data and shape)"
+
+            # Get the shape from the second input (can be initializer or Constant node)
+            shape_input_name = cur_node.input[1]
+
+            if shape_input_name in init_map:
+                # Shape is from an initializer
+                shape_init = init_map[shape_input_name]
+                new_shape = parse_onnx_int_tensor(shape_init.data_type, shape_init.raw_data)
+            else:
+                # Shape might be from a Constant node
+                const_node = find_node_with_output(graph, shape_input_name)
+                assert const_node is not None, f"Reshape shape input '{shape_input_name}' not found"
+                assert const_node.op_type == 'Constant', \
+                    f"Reshape shape must be from initializer or Constant node, got {const_node.op_type}"
+
+                # Extract value from Constant node's 'value' attribute
+                value_attr = None
+                for attr in const_node.attribute:
+                    if attr.name == 'value':
+                        value_attr = attr
+                        break
+
+                assert value_attr is not None, "Constant node must have 'value' attribute"
+                shape_tensor = value_attr.t
+                new_shape = parse_onnx_int_tensor(shape_tensor.data_type, shape_tensor.raw_data)
+
+            new_shape = tuple(int(d) for d in new_shape)
+
+            layer = ReshapeLayer(len(layers), new_shape, prev_shape)
         else:
             assert False, f"unsupported onnx op_type {op} in node {cur_node.name}"
 

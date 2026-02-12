@@ -218,6 +218,67 @@ class ReluLayer(Freezable):
         
         return rv
 
+class ConstantLayer(Freezable):
+    'constant onnx layer - outputs a fixed value'
+
+    def __init__(self, layer_num, value):
+
+        self.layer_num = layer_num
+        self.value = value
+        self.network = None # populated later when constructing network
+
+        # Constant has no input shape, output shape is the value's shape
+        self.input_shape = None
+        self.output_shape = value.shape
+
+        self.freeze_attrs()
+
+    def __str__(self):
+        return f'[Constant with output shape {self.get_output_shape()}]'
+
+    def get_input_shape(self):
+        'get the input shape to this layer'
+
+        return self.input_shape
+
+    def get_output_shape(self):
+        'get the output shape from this layer'
+
+        return self.output_shape
+
+    def transform_star(self, star):
+        'transform the star for this layer'
+
+        # Constant replaces the current state with a fixed value
+        # This means the star becomes a single point (the constant)
+        # The generator columns become zero, bias becomes the constant
+        star.a_mat = None
+        star.bias = nn_flatten(self.value)
+
+    def transform_zono(self, zono):
+        'transform the zono for this layer'
+
+        # Constant replaces state with fixed value
+        # Center becomes the constant, all generators become zero
+        zono.mat_t = None
+        zono.center = nn_flatten(self.value)
+
+    def transform_deeppoly(self, deeppoly):
+        'transform the deeppoly for this layer'
+
+        # Constant replaces state - bounds become the constant value
+        flattened = nn_flatten(self.value)
+        deeppoly.lbs = flattened.copy()
+        deeppoly.ubs = flattened.copy()
+
+    def execute(self, state):
+        '''execute the layer on a concrete state
+
+        returns output (ignores input, always returns constant)
+        '''
+
+        return self.value.copy()
+
 class FlattenLayer(Freezable):
     'flatten onnx layer'
 
@@ -266,13 +327,89 @@ class FlattenLayer(Freezable):
 
     def execute(self, state):
         '''execute the layer on a concrete state
- 
+
         returns output
         '''
 
         rv = nn_flatten(state)
         assert rv.shape == self.output_shape
-        
+
+        return rv
+
+class ReshapeLayer(Freezable):
+    'reshape onnx layer'
+
+    def __init__(self, layer_num, new_shape, input_shape):
+
+        self.layer_num = layer_num
+        self.input_shape = input_shape
+        self.new_shape = new_shape
+        self.network = None # populated later when constructing network
+
+        # Validate that total elements match
+        input_size = 1
+        for i in input_shape:
+            input_size *= i
+
+        output_size = 1
+        dynamic_dim_index = None
+        for i, dim in enumerate(new_shape):
+            if dim == -1:
+                assert dynamic_dim_index is None, "only one dimension can be -1 in reshape"
+                dynamic_dim_index = i
+            else:
+                output_size *= dim
+
+        # If there's a -1 dimension, infer its size
+        if dynamic_dim_index is not None:
+            inferred_size = input_size // output_size
+            assert input_size == output_size * inferred_size, "reshape dimensions don't match input size"
+            new_shape = list(new_shape)
+            new_shape[dynamic_dim_index] = inferred_size
+            new_shape = tuple(new_shape)
+            self.new_shape = new_shape
+        else:
+            assert input_size == output_size, f"reshape size mismatch: input {input_size} vs output {output_size}"
+
+        self.freeze_attrs()
+
+    def __str__(self):
+        return f'[Reshape from {self.get_input_shape()} to {self.get_output_shape()}]'
+
+    def get_input_shape(self):
+        'get the input shape to this layer'
+
+        return self.input_shape
+
+    def get_output_shape(self):
+        'get the output shape from this layer'
+
+        return self.new_shape
+
+    def transform_star(self, star):
+        'transform the star for this layer'
+
+        # do nothing - reshape doesn't change the abstract representation
+
+    def transform_zono(self, zono):
+        'transform the zono for this layer'
+
+        # do nothing - reshape doesn't change the abstract representation
+
+    def transform_deeppoly(self, deeppoly):
+        'transform the deeppoly for this layer'
+
+        # do nothing - reshape doesn't change the abstract representation
+
+    def execute(self, state):
+        '''execute the layer on a concrete state
+
+        returns output
+        '''
+
+        rv = state.reshape(self.new_shape)
+        assert rv.shape == self.new_shape
+
         return rv
 
 class AddLayer(Freezable):
