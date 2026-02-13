@@ -34,12 +34,13 @@ for dirpath, dirnames, filenames in os.walk('./vnncomp2025_benchmarks/benchmarks
                     unknownDic[op] += 1
             key = str(ops.difference(Optimized))
             fixableDic[key] += 1
-            if key == "set()":
+            if ops.difference(Optimized) == {'Constant', 'Conv', 'Reshape'}:
                 with open('vnncomp2025_benchmarks/all_results.csv', 'r') as f:
                     for line in f:
                         parts = line.strip().split(',')
                         if len(parts) >= 6 and str(model_path)[1:] in parts[1]:
-                            if parts[4] == "sat": # or parts[4] == "unsat":
+
+                            if parts[4] == "sat" or parts[4] == "unsat":
                                 focus[str(model_path) + parts[2]] = float(parts[5])
 
 # print(optDic)
@@ -52,7 +53,5 @@ for dirpath, dirnames, filenames in os.walk('./vnncomp2025_benchmarks/benchmarks
 
 maxim = 0.0
 for ops, num in focus.items():
-    if num > maxim:
-        maxim = num
-        print(f"{num}: {ops}")
+    print(f"{num}: {ops}")
 

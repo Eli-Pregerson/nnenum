@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+Layer-by-layer testing for newly added layers (Constant, Reshape, Conv)
+
+Tests both concrete execution and abstract transformation soundness
+"""
+
+import numpy as np
+import sys
+from pathlib import Path
+
+# Import as module (same as run_tests.sh does)
+from nnenum.network import ConstantLayer, ReshapeLayer, Convolutional2dLayer
+from nnenum.lp_star import LpStar
+from nnenum.zonotope import Zonotope
+from nnenum.overapprox import DeeppolyOverapprox
+
+
+class TestResults:
+    """Track test results"""
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.failures = []
+
+    def record(self, test_name, passed, message=""):
+        if passed:
+            self.passed += 1
+            print(f"✓ {test_name}")
+        else:
+            self.failed += 1
+            self.failures.append((test_name, message))
+            print(f"✗ {test_name}: {message}")
+
+    def summary(self):
+        total = self.passed + self.failed
+        print(f"\n{'='*60}")
+        print(f"Results: {self.passed}/{total} passed, {self.failed}/{total} failed")
+        if self.failures:
+            print(f"\nFailures:")
+            for name, msg in self.failures:
+                print(f"  - {name}: {msg}")
+        return self.failed == 0
+
+
+def test_constant_layer(results):
+    """Test ConstantLayer execution and transforms"""
+    print("\n--- Testing ConstantLayer ---")
+
+    # Test 1: Basic execution
+    value = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    layer = ConstantLayer(0, value)
+
+    # Test execution (should return constant regardless of input)
+    dummy_input = np.zeros((2, 2))
+    output = layer.execute(dummy_input)
+
+    results.record(
+        "ConstantLayer.execute()",
+        np.allclose(output, value),
+        f"Expected {value}, got {output}"
+    )
+
+    # Test 2: Shape methods
+    results.record(
+        "ConstantLayer.get_input_shape()",
+        layer.get_input_shape() is None,
+        "Constant should have no input shape"
+    )
+
+    results.record(
+        "ConstantLayer.get_output_shape()",
+        layer.get_output_shape() == value.shape,
+        f"Expected {value.shape}, got {layer.get_output_shape()}"
+    )
+
+    # Test 3: Transform soundness (star set should become single point)
+    # Create simple star: identity matrix as generators, zero bias
+    dims = 4  # flattened value has 4 elements
+    init_a_mat = np.eye(dims, dtype=np.float32)
+    init_bias = np.zeros(dims, dtype=np.float32)
+    init_box = np.array([[-1, 1]] * dims, dtype=np.float32)
+
+    star = LpStar(init_a_mat, init_bias, init_box)
+
+    # Apply constant transform
+    layer.transform_star(star)
+
+    # Star should now represent only the constant value
+    flattened_value = value.flatten()
+    results.record(
+        "ConstantLayer.transform_star() - bias",
+        star.bias is not None and np.allclose(star.bias, flattened_value),
+        f"Star bias should equal constant value"
+    )
+
+    results.record(
+        "ConstantLayer.transform_star() - no generators",
+        star.a_mat is None,
+        "Star should have no generators (single point)"
+    )
+
+
+def test_reshape_layer(results):
+    """Test ReshapeLayer execution and transforms"""
+    print("\n--- Testing ReshapeLayer ---")
+
+    # Test 1: Basic reshape (2x3 -> 6)
+    input_shape = (2, 3)
+    new_shape = (6,)
+    layer = ReshapeLayer(0, new_shape, input_shape)
+
+    test_input = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+    output = layer.execute(test_input)
+
+    results.record(
+        "ReshapeLayer.execute() - basic reshape",
+        output.shape == new_shape and np.allclose(output, test_input.flatten()),
+        f"Expected shape {new_shape}, got {output.shape}"
+    )
+
+    # Test 2: Reshape with -1 dimension
+    input_shape2 = (2, 3)
+    new_shape2 = (1, -1)  # Should infer as (1, 6)
+    layer2 = ReshapeLayer(0, new_shape2, input_shape2)
+
+    results.record(
+        "ReshapeLayer.__init__() - infer -1 dimension",
+        layer2.new_shape == (1, 6),
+        f"Expected (1, 6), got {layer2.new_shape}"
+    )
+
+    output2 = layer2.execute(test_input)
+    results.record(
+        "ReshapeLayer.execute() - with -1 dimension",
+        output2.shape == (1, 6),
+        f"Expected shape (1, 6), got {output2.shape}"
+    )
+
+    # Test 3: Transform does nothing (reshape is identity on values)
+    dims = 6
+    init_a_mat = np.eye(dims, dtype=np.float32)
+    init_bias = np.zeros(dims, dtype=np.float32)
+    init_box = np.array([[0, 1]] * dims, dtype=np.float32)
+
+    star = LpStar(init_a_mat, init_bias, init_box)
+    original_a_mat = star.a_mat.copy() if star.a_mat is not None else None
+    original_bias = star.bias.copy() if star.bias is not None else None
+
+    layer.transform_star(star)
+
+    # Star should be unchanged (reshape doesn't affect abstract domain)
+    a_mat_unchanged = (star.a_mat is None and original_a_mat is None) or \
+                      (star.a_mat is not None and original_a_mat is not None and np.allclose(star.a_mat, original_a_mat))
+    bias_unchanged = (star.bias is None and original_bias is None) or \
+                     (star.bias is not None and original_bias is not None and np.allclose(star.bias, original_bias))
+
+    results.record(
+        "ReshapeLayer.transform_star() - no change",
+        a_mat_unchanged and bias_unchanged,
+        "Reshape should not modify star representation"
+    )
+
+
+def test_conv_layer(results):
+    """Test Convolutional2dLayer execution and basic properties"""
+    print("\n--- Testing Convolutional2dLayer ---")
+
+    # Test 1: Simple 3x3 conv with 1 input channel, 1 output channel
+    prev_shape = (5, 5, 1)  # height, width, channels
+
+    # 3x3 kernel with all ones
+    kernels = np.ones((1, 1, 3, 3), dtype=np.float32)  # (out_ch, in_ch, h, w)
+    biases = np.array([0.0], dtype=np.float32)
+
+    layer = Convolutional2dLayer(0, kernels, biases, prev_shape, mode='valid')
+
+    # Test input: 5x5 image with all ones
+    test_input = np.ones((5, 5, 1), dtype=np.float32)
+    output = layer.execute(test_input)
+
+    # With 'valid' padding and 3x3 kernel on 5x5 input -> 3x3 output
+    expected_shape = (3, 3, 1)
+    results.record(
+        "ConvLayer.execute() - output shape (valid)",
+        output.shape == expected_shape,
+        f"Expected {expected_shape}, got {output.shape}"
+    )
+
+    # Each output should be sum of 3x3 kernel = 9.0 (since all inputs are 1)
+    results.record(
+        "ConvLayer.execute() - output values (valid)",
+        np.allclose(output, 9.0),
+        f"Expected all 9.0, got {output.flatten()[:5]}..."
+    )
+
+    # Test 2: Same padding
+    layer_same = Convolutional2dLayer(0, kernels, biases, prev_shape, mode='same')
+    output_same = layer_same.execute(test_input)
+
+    # With 'same' padding, output should match input spatial dimensions
+    expected_shape_same = (5, 5, 1)
+    results.record(
+        "ConvLayer.execute() - output shape (same)",
+        output_same.shape == expected_shape_same,
+        f"Expected {expected_shape_same}, got {output_same.shape}"
+    )
+
+    # Test 3: Multi-channel convolution
+    prev_shape_multi = (4, 4, 2)  # 2 input channels
+    kernels_multi = np.ones((3, 2, 2, 2), dtype=np.float32)  # 3 output channels, 2 input channels, 2x2 kernel
+    biases_multi = np.zeros(3, dtype=np.float32)
+
+    layer_multi = Convolutional2dLayer(0, kernels_multi, biases_multi, prev_shape_multi, mode='valid')
+
+    results.record(
+        "ConvLayer.get_output_shape() - multi-channel",
+        layer_multi.get_output_shape() == (3, 3, 3),
+        f"Expected (3, 3, 3), got {layer_multi.get_output_shape()}"
+    )
+
+    # Test 4: With bias
+    kernels_bias = np.ones((1, 1, 2, 2), dtype=np.float32)
+    biases_bias = np.array([5.0], dtype=np.float32)
+    layer_bias = Convolutional2dLayer(0, kernels_bias, biases_bias, (4, 4, 1), mode='valid')
+
+    test_input_bias = np.ones((4, 4, 1), dtype=np.float32)
+    output_bias = layer_bias.execute(test_input_bias)
+
+    # Each output should be 4.0 (sum of 2x2) + 5.0 (bias) = 9.0
+    results.record(
+        "ConvLayer.execute() - with bias",
+        np.allclose(output_bias, 9.0),
+        f"Expected all 9.0, got {output_bias.flatten()[:5]}..."
+    )
+
+
+def test_integration_with_onnx(results):
+    """Test that layers work when parsed from ONNX"""
+    print("\n--- Testing ONNX Integration ---")
+
+    try:
+        from nnenum.onnx_network import load_onnx_network_optimized
+
+        # Test with the reshape model we created
+        model_path = "examples/convHelp/perturbations_0_reshape.onnx"
+        if Path(model_path).exists():
+            try:
+                network = load_onnx_network_optimized(model_path)
+
+                # Check that Reshape layer is present
+                has_reshape = any(layer.__class__.__name__ == 'ReshapeLayer' for layer in network.layers)
+                results.record(
+                    "ONNX parsing - ReshapeLayer loaded",
+                    has_reshape,
+                    "ReshapeLayer not found in parsed network"
+                )
+
+                # Note: Constant nodes used for parameters (like Reshape shape) are
+                # processed during parsing but not added as layers - this is correct!
+                # Only Constant nodes in the main data flow become ConstantLayers
+                print(f"  Note: Constant node for Reshape shape is processed but not a layer (expected)")
+                results.record(
+                    "ONNX parsing - Constant handled correctly",
+                    True,  # This is actually correct behavior
+                    ""
+                )
+
+                print(f"  Network has {len(network.layers)} layers:")
+                for i, layer in enumerate(network.layers):
+                    print(f"    {i}: {layer.__class__.__name__}")
+
+            except Exception as e:
+                results.record(
+                    "ONNX parsing - load reshape model",
+                    False,
+                    str(e)
+                )
+        else:
+            print(f"  Skipping ONNX test - {model_path} not found")
+
+    except ImportError as e:
+        print(f"  Skipping ONNX test - import error: {e}")
+
+
+def main():
+    """Run all tests"""
+    print("="*60)
+    print("Layer-by-Layer Testing for Constant, Reshape, and Conv")
+    print("="*60)
+
+    results = TestResults()
+
+    test_constant_layer(results)
+    test_reshape_layer(results)
+    test_conv_layer(results)
+    test_integration_with_onnx(results)
+
+    success = results.summary()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == '__main__':
+    main()

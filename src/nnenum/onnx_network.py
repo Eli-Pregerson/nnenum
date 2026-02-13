@@ -15,7 +15,7 @@ import onnxruntime as ort
 from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_model_inputs_outputs
 from onnx.helper import ValueInfoProto, make_graph, make_model
 
-from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer
+from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
@@ -515,6 +515,46 @@ def load_onnx_network_optimized(filename):
                     weight_mat = weight_mat.transpose().copy()
 
             layer = FullyConnectedLayer(len(layers), weight_mat, bias_vec, prev_shape)
+        elif op == 'Conv':
+            # Conv has 2 or 3 inputs: data, weights, and optionally biases
+            assert len(cur_node.input) in [2, 3], "Conv should have 2 or 3 inputs"
+
+            # Get weights
+            weight_init = init_map[cur_node.input[1]]
+            assert weight_init.data_type == onnx_type_float
+
+            # ONNX Conv weight shape: (out_channels, in_channels, kernel_h, kernel_w)
+            kernels = np.frombuffer(weight_init.raw_data, dtype='<f4')
+            kernel_shape = tuple(d for d in weight_init.dims)
+            kernels = kernels.reshape(kernel_shape)
+
+            # Get biases (if present)
+            if len(cur_node.input) == 3:
+                bias_init = init_map[cur_node.input[2]]
+                assert bias_init.data_type == onnx_type_float
+                biases = np.frombuffer(bias_init.raw_data, dtype='<f4')
+            else:
+                # No bias provided, use zeros
+                biases = np.zeros(kernel_shape[0], dtype=np.float32)
+
+            # Parse attributes to determine padding mode
+            mode = 'same'  # default
+            auto_pad = None
+            pads = None
+
+            for attr in cur_node.attribute:
+                if attr.name == 'auto_pad':
+                    auto_pad = attr.s.decode('utf-8')
+                elif attr.name == 'pads':
+                    pads = list(attr.ints)
+
+            # Determine mode based on auto_pad or pads
+            if auto_pad == 'VALID' or (pads and all(p == 0 for p in pads)):
+                mode = 'valid'
+            elif auto_pad in ['SAME_UPPER', 'SAME_LOWER', 'NOTSET'] or auto_pad is None:
+                mode = 'same'
+
+            layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape, mode=mode)
         elif op == 'Reshape':
             assert len(cur_node.input) == 2, "Reshape should have 2 inputs (data and shape)"
 

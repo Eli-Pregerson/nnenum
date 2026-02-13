@@ -35,12 +35,19 @@ print(f"Parsed output shape: {output_shape}")
 target_shape = [1, -1]  # Flatten to batch_size=1, features=-1
 print(f"Target reshape: {target_shape}")
 
-# Create shape constant as an initializer
-shape_tensor = numpy_helper.from_array(
-    np.array(target_shape, dtype=np.int64),
-    name=current_output.name + "_reshape_shape"
+# Create a Constant node to output the shape tensor
+shape_const_name = current_output.name + "_reshape_shape"
+shape_const_node = helper.make_node(
+    'Constant',
+    inputs=[],
+    outputs=[shape_const_name],
+    name=shape_const_name + "_node",
+    value=numpy_helper.from_array(
+        np.array(target_shape, dtype=np.int64),
+        name=shape_const_name
+    )
 )
-model.graph.initializer.append(shape_tensor)
+model.graph.node.append(shape_const_node)
 
 # Update the existing output nodes to use intermediate name
 for node in model.graph.node:
@@ -51,7 +58,7 @@ for node in model.graph.node:
 # Create Reshape node
 reshape_node = helper.make_node(
     'Reshape',
-    inputs=[intermediate_output_name, shape_tensor.name],
+    inputs=[intermediate_output_name, shape_const_name],
     outputs=[current_output.name],
     name=current_output.name + "_reshape_node"
 )
