@@ -3,7 +3,7 @@ import onnx
 from collections import defaultdict
 
 optDic = defaultdict(int)
-Optimized = {'Add', 'Sub', 'Flatten', 'MatMul', 'Relu', 'Gemm'}
+Optimized = {'Add', 'Sub', 'Flatten', 'MatMul', 'Relu', 'Gemm', 'Conv', 'Reshape', 'Constant'}
 wDic = defaultdict(int)
 Whitelist = {'Add', 'AveragePool', 'Constant', 'Concat', 'Conv', 'Flatten', 'Gather', \
                               'Gemm', 'MatMul', 'Mul', 'Reshape', 'Relu', 'Shape', 'Sub', 'Unsqueeze', 'Slice', \
@@ -13,6 +13,25 @@ Blacklist = {'Atan', 'MaxPool', 'Sigmoid', 'Tanh'}
 unknownDic = defaultdict(int)
 fixableDic = defaultdict(int)
 focus = {}
+
+# First pass: count instances per ONNX file from instances.csv files
+onnx_instance_count = defaultdict(int)
+benchmarks_dir = './vnncomp2025_benchmarks/benchmarks'
+for benchmark_name in os.listdir(benchmarks_dir):
+    benchmark_dir = os.path.join(benchmarks_dir, benchmark_name)
+    instances_csv = os.path.join(benchmark_dir, 'instances.csv')
+    if os.path.isfile(instances_csv):
+        with open(instances_csv, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(',')
+                if len(parts) >= 1:
+                    onnx_rel_path = parts[0]
+                    # Build full path to match against model_path
+                    onnx_full_path = os.path.join(benchmark_dir, onnx_rel_path)
+                    onnx_instance_count[onnx_full_path] += 1
 
 for dirpath, dirnames, filenames in os.walk('./vnncomp2025_benchmarks/benchmarks'):
     for file in filenames:
@@ -33,7 +52,9 @@ for dirpath, dirnames, filenames in os.walk('./vnncomp2025_benchmarks/benchmarks
                 else:
                     unknownDic[op] += 1
             key = str(ops.difference(Optimized))
-            fixableDic[key] += 1
+            # Weight by number of instances using this ONNX file
+            instance_weight = onnx_instance_count.get(model_path, 1)
+            fixableDic[key] += instance_weight
             if ops.difference(Optimized) == {'Constant', 'Conv', 'Reshape'}:
                 with open('vnncomp2025_benchmarks/all_results.csv', 'r') as f:
                     for line in f:
@@ -52,6 +73,6 @@ for dirpath, dirnames, filenames in os.walk('./vnncomp2025_benchmarks/benchmarks
 # Forcing brute force goes 48 seconds to 12 mins
 
 maxim = 0.0
-for ops, num in focus.items():
+for ops, num in fixableDic.items():
     print(f"{num}: {ops}")
 

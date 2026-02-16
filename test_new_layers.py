@@ -283,10 +283,100 @@ def test_integration_with_onnx(results):
         print(f"  Skipping ONNX test - import error: {e}")
 
 
+def test_batchnorm_folding(results):
+    """Test BatchNormalization folding into Conv layers"""
+    print("\n--- Testing BatchNorm Folding ---")
+
+    # Test 1: Fold BatchNorm into Conv layer
+    # Create a simple Conv layer: 1 input channel, 2 output channels, 2x2 kernel
+    prev_shape = (4, 4, 1)  # height, width, channels
+
+    # Simple kernels: all ones
+    kernels = np.ones((2, 1, 2, 2), dtype=np.float32)  # (out_ch, in_ch, h, w)
+    biases = np.array([1.0, 2.0], dtype=np.float32)  # 2 output channels
+
+    conv_layer = Convolutional2dLayer(0, kernels, biases, prev_shape, mode='valid')
+
+    # Create BatchNorm parameters
+    # BatchNorm: y = gamma * (x - mean) / sqrt(var + eps) + beta
+    gamma = np.array([2.0, 0.5], dtype=np.float32)  # scale per output channel
+    beta = np.array([0.5, -0.5], dtype=np.float32)   # shift per output channel
+    mean = np.array([1.0, 2.0], dtype=np.float32)
+    var = np.array([1.0, 3.0], dtype=np.float32)
+    epsilon = 1e-5
+
+    # Manually compute expected folded parameters
+    # bn_scale = gamma / sqrt(var + epsilon)
+    bn_scale = gamma / np.sqrt(var + epsilon)
+    # bn_shift = beta - mean * bn_scale
+    bn_shift = beta - mean * bn_scale
+
+    expected_biases = bn_scale * biases + bn_shift
+
+    # Store original kernel values for comparison
+    original_kernel_00 = conv_layer.kernels[0][0].copy()
+    expected_kernel_00 = original_kernel_00 * bn_scale[0]
+
+    # Now simulate BatchNorm folding (what our ONNX parser does)
+    # Create new scaled kernels
+    num_out_channels = len(conv_layer.kernels)
+    for out_c in range(num_out_channels):
+        for in_c in range(len(conv_layer.kernels[out_c])):
+            conv_layer.kernels[out_c][in_c] = conv_layer.kernels[out_c][in_c] * bn_scale[out_c]
+
+    # Update biases
+    conv_layer.biases = bn_scale * biases + bn_shift
+
+    # Test 1a: Check kernels were scaled correctly
+    results.record(
+        "BatchNorm folding - kernel scaling",
+        np.allclose(conv_layer.kernels[0][0], expected_kernel_00),
+        f"Expected kernel scaled by {bn_scale[0]}"
+    )
+
+    # Test 1b: Check biases were updated correctly
+    results.record(
+        "BatchNorm folding - bias update",
+        np.allclose(conv_layer.biases, expected_biases),
+        f"Expected {expected_biases}, got {conv_layer.biases}"
+    )
+
+    # Test 2: Verify folded layer produces equivalent output
+    # Create test input
+    test_input = np.random.rand(4, 4, 1).astype(np.float32)
+
+    # Compute output with separate Conv and BatchNorm
+    conv_only = Convolutional2dLayer(0, kernels, biases, prev_shape, mode='valid')
+    conv_output = conv_only.execute(test_input)
+
+    # Apply BatchNorm manually: y = gamma * (x - mean) / sqrt(var + eps) + beta
+    # conv_output has shape (3, 3, 2) for valid mode on 4x4 input with 2x2 kernel
+    # BatchNorm is applied per channel
+    bn_output = np.zeros_like(conv_output)
+    for c in range(conv_output.shape[2]):
+        bn_output[:, :, c] = gamma[c] * (conv_output[:, :, c] - mean[c]) / np.sqrt(var[c] + epsilon) + beta[c]
+
+    # Compute output with folded Conv+BatchNorm
+    folded_output = conv_layer.execute(test_input)
+
+    results.record(
+        "BatchNorm folding - output equivalence",
+        np.allclose(folded_output, bn_output, rtol=1e-5, atol=1e-6),
+        f"Folded layer output should match Conv→BatchNorm pipeline"
+    )
+
+    # Test 3: Check output shapes
+    results.record(
+        "BatchNorm folding - output shape preserved",
+        folded_output.shape == bn_output.shape,
+        f"Expected shape {bn_output.shape}, got {folded_output.shape}"
+    )
+
+
 def main():
     """Run all tests"""
     print("="*60)
-    print("Layer-by-Layer Testing for Constant, Reshape, and Conv")
+    print("Layer-by-Layer Testing for Constant, Reshape, Conv, and BatchNorm")
     print("="*60)
 
     results = TestResults()
@@ -294,6 +384,7 @@ def main():
     test_constant_layer(results)
     test_reshape_layer(results)
     test_conv_layer(results)
+    test_batchnorm_folding(results)
     test_integration_with_onnx(results)
 
     success = results.summary()

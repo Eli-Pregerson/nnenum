@@ -427,7 +427,19 @@ def load_onnx_network_optimized(filename):
             prev_shape = layers[-1].get_output_shape()
         else:
             s_node = graph.input[0].type.tensor_type.shape
-            prev_shape = tuple(d.dim_value if d.dim_value != 0 else 1 for d in s_node.dim)
+            # ONNX format: (batch, channels, height, width) -> nnenum format: (height, width, channels)
+            # Extract all dimensions (treating 0 or missing as 1)
+            all_dims = tuple(d.dim_value if d.dim_value != 0 else 1 for d in s_node.dim)
+
+            if len(all_dims) == 4:
+                # Image input: (batch, channels, height, width) -> (height, width, channels)
+                prev_shape = (all_dims[2], all_dims[3], all_dims[1])
+            elif len(all_dims) == 2:
+                # Flat input: (batch, features) -> (features,)
+                prev_shape = (all_dims[1],)
+            else:
+                # Unexpected format, keep as-is (may fail later with better error message)
+                prev_shape = all_dims
             
         if op in ['Add', 'Sub']:
             assert len(cur_node.input) == 2
@@ -586,11 +598,81 @@ def load_onnx_network_optimized(filename):
             new_shape = tuple(int(d) for d in new_shape)
 
             layer = ReshapeLayer(len(layers), new_shape, prev_shape)
+        elif op == 'BatchNormalization':
+            # Fold BatchNorm into previous Conv or FC layer
+            # BatchNorm: y = scale * (x - mean) / sqrt(var + epsilon) + bias
+            # This can be folded as: y = (scale / sqrt(var + eps)) * x + (bias - mean * scale / sqrt(var + eps))
+
+            assert len(layers) > 0, "BatchNormalization cannot be the first layer"
+            prev_layer = layers[-1]
+
+            # BatchNorm inputs: X, scale, B, input_mean, input_var
+            assert len(cur_node.input) == 5, f"BatchNorm should have 5 inputs, got {len(cur_node.input)}"
+
+            scale_init = init_map[cur_node.input[1]]  # gamma
+            bias_init = init_map[cur_node.input[2]]   # beta
+            mean_init = init_map[cur_node.input[3]]   # running_mean
+            var_init = init_map[cur_node.input[4]]    # running_var
+
+            scale = np.frombuffer(scale_init.raw_data, dtype='<f4')
+            bias = np.frombuffer(bias_init.raw_data, dtype='<f4')
+            mean = np.frombuffer(mean_init.raw_data, dtype='<f4')
+            var = np.frombuffer(var_init.raw_data, dtype='<f4')
+
+            # Get epsilon from attributes (default 1e-5)
+            epsilon = 1e-5
+            for attr in cur_node.attribute:
+                if attr.name == 'epsilon':
+                    epsilon = attr.f
+
+            # Compute BatchNorm scaling: scale / sqrt(var + epsilon)
+            bn_scale = scale / np.sqrt(var + epsilon)
+            bn_shift = bias - mean * bn_scale
+
+            # Fold into previous layer
+            if isinstance(prev_layer, Convolutional2dLayer):
+                # For Conv: scale each output channel's kernel and bias
+                # prev_layer.kernels is list[list[2D array]]: kernels[out_ch][in_ch] = 2D kernel
+                # bn_scale/bn_shift shape: (out_channels,)
+
+                num_out_channels = len(prev_layer.kernels)
+                assert len(bn_scale) == num_out_channels, \
+                    f"BatchNorm scale size {len(bn_scale)} doesn't match Conv output channels {num_out_channels}"
+
+                # Scale kernels: create new scaled kernels (arrays are frozen/read-only)
+                for out_c in range(num_out_channels):
+                    for in_c in range(len(prev_layer.kernels[out_c])):
+                        prev_layer.kernels[out_c][in_c] = prev_layer.kernels[out_c][in_c] * bn_scale[out_c]
+
+                # Update biases: create new bias array (b_new = bn_scale * b_old + bn_shift)
+                prev_layer.biases = bn_scale * prev_layer.biases + bn_shift
+
+            elif isinstance(prev_layer, FullyConnectedLayer):
+                # For FC: scale weights and biases
+                # prev_layer.weights shape: (out_features, in_features)
+                # bn_scale/bn_shift shape: (out_features,)
+
+                num_out_features = prev_layer.weights.shape[0]
+                assert len(bn_scale) == num_out_features, \
+                    f"BatchNorm scale size {len(bn_scale)} doesn't match FC output features {num_out_features}"
+
+                # Scale weights: each output row multiplied by its bn_scale
+                prev_layer.weights = prev_layer.weights * bn_scale[:, np.newaxis]
+
+                # Update biases: b_new = bn_scale * b_old + bn_shift
+                prev_layer.biases = bn_scale * prev_layer.biases + bn_shift
+
+            else:
+                raise RuntimeError(f"BatchNormalization can only follow Conv or FC layers, got {type(prev_layer).__name__}")
+
+            # Don't create a new layer - BatchNorm is now folded into previous layer
+            layer = None
         else:
             assert False, f"unsupported onnx op_type {op} in node {cur_node.name}"
 
-        assert layer is not None
-        layers.append(layer)
+        # Only append if we created a new layer (BatchNorm doesn't create a layer)
+        if layer is not None:
+            layers.append(layer)
 
         assert len(cur_node.output) == 1, f"multiple output at onnx node {cur_node.name}"
         cur_input_name = cur_node.output[0]
