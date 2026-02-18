@@ -549,16 +549,19 @@ def load_onnx_network_optimized(filename):
                 # No bias provided, use zeros
                 biases = np.zeros(kernel_shape[0], dtype=np.float32)
 
-            # Parse attributes to determine padding mode
+            # Parse attributes to determine padding mode and stride
             mode = 'same'  # default
             auto_pad = None
             pads = None
+            strides = (1, 1)  # default
 
             for attr in cur_node.attribute:
                 if attr.name == 'auto_pad':
                     auto_pad = attr.s.decode('utf-8')
                 elif attr.name == 'pads':
                     pads = list(attr.ints)
+                elif attr.name == 'strides':
+                    strides = tuple(attr.ints)
 
             # Determine mode based on auto_pad or pads
             if auto_pad == 'VALID' or (pads and all(p == 0 for p in pads)):
@@ -566,7 +569,7 @@ def load_onnx_network_optimized(filename):
             elif auto_pad in ['SAME_UPPER', 'SAME_LOWER', 'NOTSET'] or auto_pad is None:
                 mode = 'same'
 
-            layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape, mode=mode)
+            layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape, mode=mode, strides=strides)
         elif op == 'Reshape':
             assert len(cur_node.input) == 2, "Reshape should have 2 inputs (data and shape)"
 
@@ -596,6 +599,30 @@ def load_onnx_network_optimized(filename):
                 new_shape = parse_onnx_int_tensor(shape_tensor.data_type, shape_tensor.raw_data)
 
             new_shape = tuple(int(d) for d in new_shape)
+
+            # Handle ONNX batch dimension and channel ordering
+            # ONNX shapes for images: (batch, channels, height, width)
+            # nnenum expects: (height, width, channels) - no batch dimension
+
+            prev_size = 1
+            for d in prev_shape:
+                prev_size *= d
+
+            # Check if new_shape has batch dimension (first dim is 1 or -1)
+            if len(new_shape) >= 2:
+                # Calculate size without first dimension
+                new_size_without_batch = 1
+                for d in new_shape[1:]:
+                    new_size_without_batch *= d
+
+                # If sizes match, first dim is batch - strip it
+                if new_size_without_batch == prev_size:
+                    new_shape = new_shape[1:]
+
+            # Convert ONNX image format (C, H, W) to nnenum format (H, W, C)
+            if len(new_shape) == 3:
+                # Assume ONNX (channels, height, width) -> nnenum (height, width, channels)
+                new_shape = (new_shape[1], new_shape[2], new_shape[0])
 
             layer = ReshapeLayer(len(layers), new_shape, prev_shape)
         elif op == 'BatchNormalization':
@@ -856,8 +883,10 @@ def stan_select_model_inputs_outputs(model, dtype, inputs, outputs, io_shapes):
                        var_out, init_out)
 
     #print(f"making model with inputs {inputs} / outputs {outputs} and nodes len: {len(keep_nodes)}")
-    onnx_model = make_model_with_graph(model, graph)
-        
+    # Skip SSA validation for submodels - ResNets have skip connections where outputs
+    # are used by multiple downstream nodes, which the strict SSA checker rejects
+    onnx_model = make_model_with_graph(model, graph, check_model=False)
+
     return onnx_model
 
 def extract_ordered_relus(model, start):
@@ -906,6 +935,57 @@ def extract_ordered_relus(model, start):
                 marked_values.append(out)
 
     return relu_nodes
+
+def extract_ordered_split_nodes(model, start):
+    '''extract nodes that should split the network (ReLU, Add, etc.) in topological order
+
+    For ResNets, Add nodes merge skip connections and must be treated as split points
+    to avoid creating submodels with multiple inputs.
+
+    returns an ordered list of (node, node_type) tuples
+    '''
+
+    split_ops = {'Relu', 'Add'}  # Operations that split the network into sections
+    split_nodes = []
+    marked_values = [start]
+    marked_nodes = []
+
+    modified = True
+
+    while modified:
+        modified = False
+
+        for index, node in enumerate(model.graph.node):
+
+            # node was already processed
+            if index in marked_nodes:
+                continue
+
+            should_process = False
+
+            for inp in node.input:
+                if inp in marked_values:
+                    should_process = True
+                    break
+
+            # none of the node's inputs were marked
+            if not should_process:
+                continue
+
+            # process the node!
+            modified = True
+            marked_nodes.append(index)
+
+            if node.op_type in split_ops:
+                split_nodes.append((node, node.op_type))
+
+            for out in node.output:
+                if out in marked_values:
+                    continue
+
+                marked_values.append(out)
+
+    return split_nodes
 
 def make_model_with_graph(model, graph, check_model=True):
     'copy a model with a new graph'

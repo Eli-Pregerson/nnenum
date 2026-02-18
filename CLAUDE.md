@@ -55,7 +55,7 @@ All layers inherit from `Freezable` base class and implement standard interface:
 - `MatMulLayer` - Matrix multiplication without bias
 - `FullyConnectedLayer` - Affine transformation (Wx + b)
 - `ReluLayer` - ReLU activation (triggers branching in verification)
-- `Convolutional2dLayer` - 2D convolution with kernels and biases
+- `Convolutional2dLayer` - 2D convolution with kernels, biases, and stride support (for downsampling)
 - `PoolingLayer` - Max/mean pooling (not in optimized path)
 
 **ONNX Parsing**:

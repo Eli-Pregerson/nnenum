@@ -373,6 +373,94 @@ def test_batchnorm_folding(results):
     )
 
 
+def test_strided_conv(results):
+    """Test strided convolutions"""
+    print("\n--- Testing Strided Convolutions ---")
+
+    # Test 1: Stride=2 downsampling with 1x1 kernel
+    print("\nTest: Stride=2 with 1x1 kernel")
+    input_shape = (8, 8, 3)
+    kernels = np.random.randn(4, 3, 1, 1).astype(np.float32)  # 4 output channels, 3 input channels
+    biases = np.random.randn(4).astype(np.float32)
+
+    layer = Convolutional2dLayer(0, kernels, biases, input_shape, mode='same', strides=(2, 2))
+
+    # Check output shape
+    expected_output_shape = (4, 4, 4)  # 8/2 = 4, 8/2 = 4, 4 output channels
+    results.record(
+        "Strided conv - output shape with stride=2",
+        layer.get_output_shape() == expected_output_shape,
+        f"Expected {expected_output_shape}, got {layer.get_output_shape()}"
+    )
+
+    # Test execution
+    input_data = np.random.randn(*input_shape).astype(np.float32)
+    output = layer.execute(input_data)
+    results.record(
+        "Strided conv - execution produces correct shape",
+        output.shape == expected_output_shape,
+        f"Expected {expected_output_shape}, got {output.shape}"
+    )
+
+    # Test 2: Stride=2 with 3x3 kernel (VALID mode)
+    print("\nTest: Stride=2 with 3x3 kernel (VALID)")
+    input_shape = (10, 10, 2)
+    kernels = np.random.randn(3, 2, 3, 3).astype(np.float32)
+    biases = np.random.randn(3).astype(np.float32)
+
+    layer = Convolutional2dLayer(0, kernels, biases, input_shape, mode='valid', strides=(2, 2))
+
+    # VALID mode: output = (input - kernel + 1) / stride
+    # (10 - 3 + 1) / 2 = 8 / 2 = 4
+    expected_output_shape = (4, 4, 3)
+    results.record(
+        "Strided conv (VALID) - output shape calculation",
+        layer.get_output_shape() == expected_output_shape,
+        f"Expected {expected_output_shape}, got {layer.get_output_shape()}"
+    )
+
+    input_data = np.random.randn(*input_shape).astype(np.float32)
+    output = layer.execute(input_data)
+    results.record(
+        "Strided conv (VALID) - execution output shape",
+        output.shape == expected_output_shape,
+        f"Expected {expected_output_shape}, got {output.shape}"
+    )
+
+    # Test 3: Transform star with strided conv
+    print("\nTest: Star transformation with strided conv")
+    input_shape = (4, 4, 2)
+    kernels = np.ones((2, 2, 2, 2), dtype=np.float32)  # Simple kernels for testing
+    biases = np.zeros(2, dtype=np.float32)
+
+    layer = Convolutional2dLayer(0, kernels, biases, input_shape, mode='same', strides=(2, 2))
+
+    # Create a simple star set
+    input_size = 4 * 4 * 2
+    init_a_mat = np.eye(input_size, dtype=np.float32)[:, :5]  # Use first 5 generators
+    init_bias = np.zeros(input_size, dtype=np.float32)
+    init_box = [(-1.0, 1.0)] * 5
+
+    star = LpStar(init_a_mat, init_bias, init_box)
+
+    # Transform
+    layer.transform_star(star)
+
+    # Check output dimensions
+    expected_output_size = 2 * 2 * 2  # (4/2) * (4/2) * 2
+    results.record(
+        "Strided conv - star transform output size",
+        star.a_mat.shape[0] == expected_output_size,
+        f"Expected {expected_output_size}, got {star.a_mat.shape[0]}"
+    )
+
+    results.record(
+        "Strided conv - star transform preserves generators",
+        star.a_mat.shape[1] == 5,
+        f"Expected 5 generators, got {star.a_mat.shape[1]}"
+    )
+
+
 def main():
     """Run all tests"""
     print("="*60)
@@ -384,6 +472,7 @@ def main():
     test_constant_layer(results)
     test_reshape_layer(results)
     test_conv_layer(results)
+    test_strided_conv(results)
     test_batchnorm_folding(results)
     test_integration_with_onnx(results)
 

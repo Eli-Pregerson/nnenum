@@ -720,14 +720,15 @@ class Convolutional2dLayer(Freezable):
     outputs multi-channel 2d data
     '''
 
-    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='same', boundary='fill'):
+    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='same', boundary='fill', strides=(1, 1)):
         self.layer_num = layer_num
         self.biases = biases
         self.mode = mode
         self.boundary = boundary
+        self.strides = strides if isinstance(strides, tuple) else (strides, strides)
 
         assert isinstance(prev_layer_output_shape, tuple), f"prev_layer_shape was {prev_layer_output_shape}"
-        
+
         self.prev_layer_output_shape = prev_layer_output_shape
 
         self.network = None # assigned on network construction
@@ -776,10 +777,15 @@ class Convolutional2dLayer(Freezable):
         depth = len(self.kernels)
         height = self.prev_layer_output_shape[0]
         width = self.prev_layer_output_shape[1]
+        kernel_h = self.kernels[0][0].shape[0]
+        kernel_w = self.kernels[0][0].shape[1]
 
         if self.mode == 'valid':
-            height -= self.kernels[0][0].shape[0] - 1
-            width -= self.kernels[0][0].shape[1] - 1
+            height = (height - kernel_h) // self.strides[0] + 1
+            width = (width - kernel_w) // self.strides[1] + 1
+        else:  # mode == 'same'
+            height = (height + self.strides[0] - 1) // self.strides[0]
+            width = (width + self.strides[1] - 1) // self.strides[1]
 
         return (height, width, depth)
 
@@ -867,21 +873,24 @@ class Convolutional2dLayer(Freezable):
 
             for i, channel_kernel in enumerate(kernel):
                 # depth is last channel (bad for convolution performance I think)
-                state2d = state[:, :, i] 
+                state2d = state[:, :, i]
                 Timers.tic('convolve2d')
                 channel_out = convolve2d(state2d, channel_kernel, mode=self.mode, boundary=self.boundary)
                 Timers.toc('convolve2d')
 
                 Timers.tic('add')
+                # Apply stride by subsampling
+                if self.strides != (1, 1):
+                    channel_out = channel_out[::self.strides[0], ::self.strides[1]]
                 out += channel_out
                 Timers.toc('add')
-                
+
         Timers.tic('output transpose')
         output = np.array(output, dtype=float)
         # convert to y, x, z
         output = output.transpose((1, 2, 0))
         Timers.toc('output transpose')
-    
+
         Timers.toc('execute Convolutional2dLayer')
 
         return output
