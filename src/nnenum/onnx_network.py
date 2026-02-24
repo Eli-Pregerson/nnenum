@@ -15,7 +15,7 @@ import onnxruntime as ort
 from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_model_inputs_outputs
 from onnx.helper import ValueInfoProto, make_graph, make_model
 
-from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer
+from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer, SkipAddLayer
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
@@ -263,18 +263,40 @@ class LinearOnnxSubnetworkLayer(Freezable):
 
         return rv
 
-def find_node_with_input(graph, input_name):
-    'find the unique onnx node with the given input, can return None'
+def find_node_with_input(graph, input_name, init_map=None):
+    '''Find the next node on the main path that accepts input_name.
 
-    rv = None
+    For skip connections, a tensor can be consumed by two nodes: the main-path
+    next node AND the skip-merge Add node.  When multiple consumers exist we
+    return the non-skip-merge node (the main-path continuation).  A skip-merge
+    Add is an Add node where BOTH inputs are activations (neither is an
+    initializer).
+    '''
 
+    candidates = []
     for n in graph.node:
-        for i in n.input:
-            if i == input_name:
-                assert rv is None, f"multiple onnx nodes accept network input {input_name}"
-                rv = n
+        if input_name in n.input:
+            candidates.append(n)
 
-    return rv
+    if len(candidates) == 0:
+        return None
+    elif len(candidates) == 1:
+        return candidates[0]
+    else:
+        # Multiple consumers: skip-connection case.
+        # Filter out skip-merge Add nodes (Add where both inputs are activations).
+        def is_skip_merge_add(n):
+            return (n.op_type == 'Add' and
+                    init_map is not None and
+                    all(inp not in init_map for inp in n.input))
+
+        non_merge = [n for n in candidates if not is_skip_merge_add(n)]
+        if len(non_merge) == 1:
+            return non_merge[0]
+        # If still ambiguous, fall back to first candidate (may error later)
+        assert len(non_merge) > 0, \
+            f"all consumers of '{input_name}' are skip-merge Adds — cannot determine main path"
+        return non_merge[0]
 
 def find_node_with_output(graph, output_name):
     'find the onnx node with the given output, can return None'
@@ -285,6 +307,177 @@ def find_node_with_output(graph, output_name):
                 return n
 
     return None
+
+def _trace_skip_branch(graph, skip_inp, tensor_to_layer, init_map, max_depth=20):
+    '''Trace backward from skip_inp to find the branch-start tensor.
+
+    Returns (branch_start_tensor, nodes_in_forward_order) where:
+      - branch_start_tensor is a tensor already in tensor_to_layer
+      - nodes_in_forward_order is the ordered list of ONNX nodes on the skip
+        path (from branch start to skip_inp)
+    Returns None if tracing fails.
+    '''
+    chain = []  # (node, main_input_name, output_name)
+    cur_out = skip_inp
+    depth = 0
+
+    while cur_out not in tensor_to_layer and depth < max_depth:
+        producing_node = find_node_with_output(graph, cur_out)
+        if producing_node is None:
+            return None
+        # Find the one non-initializer input (the "data" input)
+        main_inputs = [inp for inp in producing_node.input if inp not in init_map]
+        if len(main_inputs) != 1:
+            return None  # multi-activation input, can't trace linearly
+        chain.append((producing_node, main_inputs[0], cur_out))
+        cur_out = main_inputs[0]
+        depth += 1
+
+    if cur_out not in tensor_to_layer:
+        return None  # exceeded depth or couldn't find branch start
+
+    chain.reverse()  # now forward order: branch_start → skip_inp
+    nodes_forward = [c[0] for c in chain]
+    return cur_out, nodes_forward
+
+
+def _parse_skip_branch_nodes(nodes, init_map, branch_shape, onnx_type_float):
+    '''Parse ONNX nodes on a skip branch (all linear) into nnenum layer objects.
+
+    BatchNorm is folded into the preceding Conv/FC layer.
+    Returns a list of layer objects, or raises RuntimeError if parsing fails.
+    '''
+    from nnenum.network import Convolutional2dLayer, FullyConnectedLayer, FlattenLayer, AddLayer
+
+    skip_layers = []
+    prev_shape = branch_shape
+    i = 0
+
+    while i < len(nodes):
+        node = nodes[i]
+        op = node.op_type
+        layer_num = len(skip_layers)  # dummy index (not in main layers list)
+
+        if op == 'Conv':
+            weight_init = init_map.get(node.input[1])
+            if weight_init is None or weight_init.data_type != onnx_type_float:
+                raise RuntimeError(f"Skip branch Conv node has unsupported weight type")
+
+            kernels = np.frombuffer(weight_init.raw_data, dtype='<f4').copy()
+            kernel_shape = tuple(d for d in weight_init.dims)
+            kernels = kernels.reshape(kernel_shape)
+
+            if len(node.input) >= 3 and node.input[2] in init_map:
+                bias_init = init_map[node.input[2]]
+                biases = np.frombuffer(bias_init.raw_data, dtype='<f4').copy()
+            else:
+                biases = np.zeros(kernel_shape[0], dtype=np.float32)
+
+            mode = 'same'
+            strides = (1, 1)
+            for attr in node.attribute:
+                if attr.name == 'auto_pad':
+                    auto_pad = attr.s.decode('utf-8')
+                    if auto_pad == 'VALID':
+                        mode = 'valid'
+                elif attr.name == 'pads':
+                    pads = list(attr.ints)
+                    if all(p == 0 for p in pads):
+                        mode = 'valid'
+                elif attr.name == 'strides':
+                    strides = tuple(attr.ints)
+
+            layer = Convolutional2dLayer(layer_num, kernels, biases, prev_shape, mode=mode, strides=strides)
+
+            # Fold following BatchNorm into this Conv
+            if i + 1 < len(nodes) and nodes[i + 1].op_type == 'BatchNormalization':
+                bn = nodes[i + 1]
+                scale = np.frombuffer(init_map[bn.input[1]].raw_data, dtype='<f4')
+                bn_bias = np.frombuffer(init_map[bn.input[2]].raw_data, dtype='<f4')
+                mean = np.frombuffer(init_map[bn.input[3]].raw_data, dtype='<f4')
+                var = np.frombuffer(init_map[bn.input[4]].raw_data, dtype='<f4')
+                epsilon = 1e-5
+                for attr in bn.attribute:
+                    if attr.name == 'epsilon':
+                        epsilon = attr.f
+                bn_scale = scale / np.sqrt(var + epsilon)
+                bn_shift = bn_bias - mean * bn_scale
+                num_out_ch = len(layer.kernels)
+                for out_c in range(num_out_ch):
+                    for in_c in range(len(layer.kernels[out_c])):
+                        layer.kernels[out_c][in_c] = layer.kernels[out_c][in_c] * bn_scale[out_c]
+                layer.biases = bn_scale * layer.biases + bn_shift
+                i += 1  # consumed the BN node
+
+            skip_layers.append(layer)
+            prev_shape = layer.get_output_shape()
+
+        elif op == 'BatchNormalization':
+            # Should have been consumed by the preceding Conv; skip standalone BN
+            pass
+
+        elif op == 'Gemm':
+            weight_init = init_map.get(node.input[1])
+            bias_init = init_map.get(node.input[2])
+            if weight_init is None or bias_init is None:
+                raise RuntimeError("Skip branch Gemm node missing weight/bias")
+            b = np.frombuffer(weight_init.raw_data, dtype='<f4')
+            shape = tuple(d for d in reversed(weight_init.dims))
+            weight_mat = nn_unflatten(b, shape, order='F')
+            b = np.frombuffer(bias_init.raw_data, dtype='<f4')
+            shape2 = tuple(d for d in reversed(bias_init.dims))
+            bias_vec = nn_unflatten(b, shape2, order='F')
+            for a in node.attribute:
+                if a.name == 'transB' and a.i == 1:
+                    weight_mat = weight_mat.transpose().copy()
+            layer = FullyConnectedLayer(layer_num, weight_mat, bias_vec, prev_shape)
+            skip_layers.append(layer)
+            prev_shape = layer.get_output_shape()
+
+        elif op == 'MatMul':
+            weight_init = init_map.get(node.input[1])
+            if weight_init is None:
+                raise RuntimeError("Skip branch MatMul missing weight")
+            from nnenum.network import MatMulLayer
+            b = np.frombuffer(weight_init.raw_data, dtype='<f4')
+            shape = tuple(d for d in reversed(weight_init.dims))
+            weight_mat = nn_unflatten(b, shape, order='F')
+            layer = MatMulLayer(layer_num, weight_mat, prev_shape)
+            skip_layers.append(layer)
+            prev_shape = layer.get_output_shape()
+
+        elif op == 'Flatten':
+            layer = FlattenLayer(layer_num, prev_shape)
+            skip_layers.append(layer)
+            prev_shape = layer.get_output_shape()
+
+        elif op in ['Add', 'Sub']:
+            # Bias add on skip path (one input is initializer)
+            inp0, inp1 = node.input[0], node.input[1]
+            if inp0 in init_map or inp1 in init_map:
+                bias_inp = inp0 if inp0 in init_map else inp1
+                init = init_map[bias_inp]
+                b = np.frombuffer(init.raw_data, dtype='<f4')
+                shape = tuple(d for d in init.dims)
+                b = nn_unflatten(b, shape, order='F')
+                if op == 'Sub':
+                    b = -1 * b
+                layer = AddLayer(layer_num, b)
+                skip_layers.append(layer)
+                prev_shape = layer.get_output_shape()
+            else:
+                raise RuntimeError(f"Skip branch has an activation Add (not bias), unsupported")
+
+        elif op == 'Relu':
+            raise RuntimeError("Skip branch contains Relu — non-linear skip unsupported")
+
+        else:
+            raise RuntimeError(f"Unsupported op '{op}' on skip branch")
+
+        i += 1
+
+    return skip_layers
+
 
 def parse_onnx_int_tensor(data_type, raw_data):
     'parse an ONNX integer tensor from raw bytes, returns numpy array'
@@ -381,10 +574,10 @@ def load_onnx_network_optimized(filename):
 
     # the input to the network is the one not in all_inputs_list and not in all_outputs_list
     network_input = None
-    
-    for i in all_input_names:
-        if i not in all_initializer_names and i not in all_output_names:
-            assert network_input is None, f"multiple onnx network inputs {network_input} and {i}"        
+
+    for i in set(all_input_names):  # Use set to avoid checking duplicates
+        if i and i not in all_initializer_names and i not in all_output_names:  # Skip empty strings
+            assert network_input is None, f"multiple onnx network inputs {network_input} and {i}"
             network_input = i
 
     assert network_input, "did not find onnx network input"
@@ -405,22 +598,43 @@ def load_onnx_network_optimized(filename):
     i = input_map[network_input]
 
     # find the node which takes the input (probably node 0)
-    cur_node = find_node_with_input(graph, network_input)
+    cur_node = find_node_with_input(graph, network_input, init_map)
     cur_input_name = network_input
 
-    # ok! now proceed recusively
+    # ok! now proceed recursively
     layers = []
+
+    # Map from ONNX output tensor name to the star_cache key that holds the
+    # star AT that tensor.  key = len(layers) right after the producing layer
+    # is appended, which equals the cur_layer at which _maybe_cache_star will
+    # capture the star produced by that layer.
+    tensor_to_layer = {network_input: 0}
+
+    # Map from ONNX tensor name to its nnenum shape (tuple) at that tensor.
+    # Used to determine the branch-point shape when tracing non-identity skip paths.
+    # We'll populate it after computing prev_shape for the first node.
+    tensor_to_shape = {}  # filled in as we parse
+
+    # DAG predecessors: skip_add_layer_idx -> [skip_src_cache_key, main_src_layer_idx]
+    dag_predecessors = {}
 
     # data types
     onnx_type_float = 1
     onnx_type_int = 2
 
     while cur_node is not None:
-        assert cur_node.input[0] == cur_input_name, \
-            f"cur_node.input[0] ({cur_node.input[0]}) should be previous output ({cur_input_name}) in " + \
-            f"node:\n{cur_node.name}"
-        
         op = cur_node.op_type
+
+        # For Add/Sub with skip connections, cur_input_name may appear at index 1
+        # instead of index 0.  Handle this before the general assertion.
+        if op in ['Add', 'Sub'] and cur_node.input[0] != cur_input_name:
+            assert cur_input_name in cur_node.input, \
+                f"cur_input_name ({cur_input_name}) not in Add node inputs {list(cur_node.input)}"
+        else:
+            assert cur_node.input[0] == cur_input_name, \
+                f"cur_node.input[0] ({cur_node.input[0]}) should be previous output " \
+                f"({cur_input_name}) in node:\n{cur_node.name}"
+
         layer = None
 
         if layers:
@@ -440,21 +654,67 @@ def load_onnx_network_optimized(filename):
             else:
                 # Unexpected format, keep as-is (may fail later with better error message)
                 prev_shape = all_dims
+            # Record the network-input shape for skip-branch tracing
+            tensor_to_shape[cur_input_name] = prev_shape
             
         if op in ['Add', 'Sub']:
             assert len(cur_node.input) == 2
-            init = init_map[cur_node.input[1]]
-            assert init.data_type == onnx_type_float
 
-            b = np.frombuffer(init.raw_data, dtype='<f4') # little endian float32
-                # note shapes are not reversed here... acasxu input is 1, 1, 1, 5, but dim_value is 1, 1, 1, 5
-            shape = tuple(d for d in init.dims) # note dims reversed, acasxu has 5, 50 but want 5 cols
-            b = nn_unflatten(b, shape, order='F')
+            # Determine which input is the "other" (not the main path activation).
+            # For standard bias Add: one input is an initializer.
+            # For skip-connection Add: both inputs are activations.
+            inp0, inp1 = cur_node.input[0], cur_node.input[1]
 
-            if op == 'Sub':
-                b = -1 * b
+            if inp0 in init_map or inp1 in init_map:
+                # Bias add: one input is an initializer (constant bias)
+                bias_inp = inp0 if inp0 in init_map else inp1
+                init = init_map[bias_inp]
+                assert init.data_type == onnx_type_float
 
-            layer = AddLayer(len(layers), b)
+                b = np.frombuffer(init.raw_data, dtype='<f4')
+                shape = tuple(d for d in init.dims)
+                b = nn_unflatten(b, shape, order='F')
+
+                if op == 'Sub':
+                    b = -1 * b
+
+                layer = AddLayer(len(layers), b)
+            else:
+                # Skip-connection Add: both inputs are activations.
+                # Identify which is the main-path (= cur_input_name) and which is skip.
+                if inp1 == cur_input_name:
+                    main_inp, skip_inp = inp1, inp0
+                else:
+                    main_inp, skip_inp = inp0, inp1
+
+                skip_cache_key = tensor_to_layer.get(skip_inp)
+
+                if skip_cache_key is not None:
+                    # Identity (or previously-parsed) skip: branch point star is cached.
+                    layer = SkipAddLayer(len(layers), input_shape=prev_shape)
+                else:
+                    # Non-identity skip: the skip tensor was produced by a side branch
+                    # (e.g. a 1x1 Conv+BN projection in ResNets) that was not visited by
+                    # the main-path parser.  Trace back, parse the side-branch nodes, and
+                    # fold them into SkipAddLayer.skip_layers.
+                    trace = _trace_skip_branch(graph, skip_inp, tensor_to_layer, init_map)
+                    assert trace is not None, (
+                        f"Skip-source tensor '{skip_inp}' not found in tensor_to_layer "
+                        f"and skip branch could not be traced")
+
+                    branch_start_tensor, skip_nodes = trace
+                    skip_cache_key = tensor_to_layer[branch_start_tensor]
+                    branch_shape = tensor_to_shape.get(branch_start_tensor, prev_shape)
+
+                    skip_layers = _parse_skip_branch_nodes(
+                        skip_nodes, init_map, branch_shape, onnx_type_float)
+
+                    layer = SkipAddLayer(len(layers), input_shape=prev_shape,
+                                        skip_layers=skip_layers,
+                                        skip_branch_shape=branch_shape)
+
+                # Record DAG: SkipAdd layer index -> [skip_src_cache_key, main_src_layer_idx]
+                dag_predecessors[len(layers)] = [skip_cache_key, len(layers) - 1]
         elif op == 'Constant':
             # Extract constant value from node's 'value' attribute
             value_attr = None
@@ -704,13 +964,23 @@ def load_onnx_network_optimized(filename):
         assert len(cur_node.output) == 1, f"multiple output at onnx node {cur_node.name}"
         cur_input_name = cur_node.output[0]
 
-        #print(f"{cur_node.name} -> {cur_input_name}")
-        cur_node = find_node_with_input(graph, cur_input_name)
+        # Record the star_cache key for this output tensor.
+        # star_cache[len(layers)] will hold the star AT cur_input_name when it
+        # is populated by _maybe_cache_star at the start of the next layer.
+        # For BatchNorm (layer=None), len(layers) hasn't changed, so the BN
+        # output maps to the same cache key as the preceding Conv/FC output.
+        tensor_to_layer[cur_input_name] = len(layers)
+
+        # Track the nnenum shape at this tensor for skip-branch parsing.
+        if layers:
+            tensor_to_shape[cur_input_name] = layers[-1].get_output_shape()
+
+        cur_node = find_node_with_input(graph, cur_input_name, init_map)
 
     assert cur_input_name == network_output, \
-        f"output witout node {cur_input_name} is not network output {network_output}"
+        f"output without node {cur_input_name} is not network output {network_output}"
 
-    return NeuralNetwork(layers)
+    return NeuralNetwork(layers, dag_predecessors=dag_predecessors)
 
 def stan_select_model_inputs_outputs(model, dtype, inputs, outputs, io_shapes):
     """

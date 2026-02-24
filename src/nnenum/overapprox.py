@@ -10,7 +10,7 @@ from nnenum.timerutil import Timers
 from nnenum.util import Freezable
 from nnenum.prefilter import update_bounds_lp, sort_splits
 from nnenum.specification import DisjunctiveSpec
-from nnenum.network import ReluLayer, FullyConnectedLayer, nn_flatten, nn_unflatten
+from nnenum.network import ReluLayer, FullyConnectedLayer, SkipAddLayer, nn_flatten, nn_unflatten
 
 def try_quick_overapprox(ss, network, spec, start_time):
     'try a quick overapproximation, return is_safe, concrete_io_tuple'
@@ -77,14 +77,22 @@ def make_prerelu_sims(ss, network):
 
         while layer_num + 1 < len(network.layers):
             layer_num += 1
-            
+
             layer = network.layers[layer_num]
             rv[layer_num] = state
 
-            shape = layer.get_input_shape()
-            input_tensor = nn_unflatten(state, shape).astype(ss.star.a_mat.dtype)
-            output_tensor = layer.execute(input_tensor)
-            state = nn_flatten(output_tensor)
+            if isinstance(layer, SkipAddLayer) and network.dag_predecessors:
+                # SkipAdd: combine skip-path simulation with current (main-path) simulation
+                skip_cache_key = network.dag_predecessors[layer_num][0]
+                skip_sim = ss.prefilter.simulation_cache.get(skip_cache_key)
+                if skip_sim is not None:
+                    state = state + skip_sim
+                # else: skip sim not available, leave state unchanged (conservative)
+            elif not isinstance(layer, SkipAddLayer):
+                shape = layer.get_input_shape()
+                input_tensor = nn_unflatten(state, shape).astype(ss.star.a_mat.dtype)
+                output_tensor = layer.execute(input_tensor)
+                state = nn_flatten(output_tensor)
 
         # save final output
         rv[len(network.layers)] = state
@@ -360,11 +368,31 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
 
     layer_num += 1
 
+    # Determine which layer indices are skip sources needed by downstream SkipAddLayers
+    # that will be reached during this round (i.e., beyond the starting ReLU layer).
+    # These won't be in ss_init's caches (propagation stopped at ss_init.cur_layer),
+    # so we must save intermediate overapprox states as we pass through them.
+    skip_source_layers = set()
+    for l_idx in range(layer_num, len(network.layers)):
+        l = network.layers[l_idx]
+        if isinstance(l, SkipAddLayer) and l_idx in network.dag_predecessors:
+            src = network.dag_predecessors[l_idx][0]
+            if src >= layer_num:
+                skip_source_layers.add(src)
+
+    # Cache: layer_num -> list of state copies (one per s in `sets`), saved BEFORE
+    # that layer is applied.  Used by downstream SkipAddLayers in this round.
+    overapprox_skip_states = {}
+
     # run remaining layers with newly-computed bounds
     remaining_layers = network.layers[layer_num:]
-    
+
     for layer_index, layer in enumerate(remaining_layers):
         check_cancel_func()
+
+        # Save overapprox state BEFORE processing this layer if it is a skip source.
+        if layer_num in skip_source_layers:
+            overapprox_skip_states[layer_num] = [s.get_skip_state_copy() for s in sets]
 
         if not ss_init.branch_tuples and Settings.PRINT_OUTPUT and Settings.PRINT_OVERAPPROX_OUTPUT:
             layer_start = time.perf_counter()
@@ -372,9 +400,9 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
 
             if isinstance(sets[0], ZonoOverapprox):
                 extra = f' (zono shape: {sets[0].zono.mat_t.shape})'
-            
+
             print(f"Layer {layer_index + 1}/{len(remaining_layers)}: {type(layer).__name__}{extra}...", end='', flush=True)
-        
+
         if isinstance(layer, ReluLayer):
             sim = None if prerelu_sims is None else prerelu_sims[layer_num]
             split_indices = None
@@ -393,7 +421,7 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
             # bounds are now as tight as they will get
             if split_indices is None:
                 split_indices = make_split_indices(layer_bounds)
-                
+
             split_indices = sort_splits(layer_bounds, split_indices)
             zero_indices = np.nonzero(layer_bounds[:, 1] < -Settings.SPLIT_TOLERANCE)[0]
 
@@ -402,10 +430,24 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
         else:
             # non-relu layer
             Timers.tic('transform_linear')
-            
-            for s in sets:
-                s.transform_linear(layer)
-                check_cancel_func()
+
+            if isinstance(layer, SkipAddLayer) and network.dag_predecessors:
+                # SkipAdd: combine skip-path state with current (main-path) state.
+                # Prefer states saved during this overapprox round (for skip sources
+                # that are beyond the initial propagation's stopping point).
+                # Fall back to ss_init's exact caches for earlier skip sources.
+                skip_cache_key = network.dag_predecessors[layer_num][0]
+                saved_states = overapprox_skip_states.get(skip_cache_key)
+                for i, s in enumerate(sets):
+                    if saved_states is not None:
+                        s.transform_skip_linear_from_saved(layer, saved_states[i])
+                    else:
+                        s.transform_skip_linear(layer, skip_cache_key, ss_init)
+                    check_cancel_func()
+            else:
+                for s in sets:
+                    s.transform_linear(layer)
+                    check_cancel_func()
 
             Timers.toc('transform_linear')
 
@@ -460,6 +502,26 @@ class StarOverapprox(Freezable):
         'affine transformation'
 
         layer.transform_star(self.star)
+
+    def get_skip_state_copy(self):
+        'return a copy of the current star for use as a skip-source during an overapprox round'
+
+        return self.star.copy()
+
+    def transform_skip_linear(self, layer, skip_cache_key, ss_init):
+        'affine transformation for SkipAddLayer using cached skip-path star'
+
+        star_skip = ss_init.star_cache.get(skip_cache_key)
+        if star_skip is not None:
+            layer.transform_star(star_skip, self.star)
+        else:
+            # Skip source not available; leave star unchanged (unsound but graceful)
+            pass
+
+    def transform_skip_linear_from_saved(self, layer, saved_star):
+        'apply SkipAdd using a star saved during this overapprox round at the skip-source layer'
+
+        layer.transform_star(saved_star, self.star)
 
     def tighten_bounds(self, layer_bounds, split_indices, sim, check_cancel_func, depth):
         '''
@@ -543,6 +605,26 @@ class ZonoOverapprox(Freezable):
         'affine transformation'
 
         layer.transform_zono(self.zono)
+
+    def get_skip_state_copy(self):
+        'return a copy of the current zonotope for use as a skip-source during an overapprox round'
+
+        return self.zono.deep_copy()
+
+    def transform_skip_linear(self, layer, skip_cache_key, ss_init):
+        'affine transformation for SkipAddLayer using cached skip-path zonotope'
+
+        zono_skip = ss_init.prefilter.zono_cache.get(skip_cache_key)
+        if zono_skip is not None:
+            layer.transform_zono(zono_skip, self.zono)
+        else:
+            # Skip source not available; leave zono unchanged (unsound but graceful)
+            pass
+
+    def transform_skip_linear_from_saved(self, layer, saved_zono):
+        'apply SkipAdd using a zonotope saved during this overapprox round at the skip-source layer'
+
+        layer.transform_zono(saved_zono, self.zono)
 
     def tighten_bounds(self, layer_bounds, _split_indices, _sim, _check_cancel_func, _depth):
         '''
@@ -773,6 +855,14 @@ class DeeppolyOverapprox(Freezable):
         'affine transformation'
 
         layer.transform_deeppoly(self)
+
+    def transform_skip_linear(self, layer, skip_cache_key, ss_init):
+        'affine transformation for SkipAddLayer (DeepPoly not yet supported for skip connections)'
+
+        raise NotImplementedError(
+            "DeepPoly overapproximation does not yet support SkipAddLayer. "
+            "Use zono or star overapprox for skip connection networks.")
+
         # ubcoef_nl, ubconst_nl, lbcoef_nl, lbconst_nl = layer.transform_deeppoly()
 
         # # back substitution
