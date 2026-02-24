@@ -670,10 +670,6 @@ def load_onnx_network_optimized(filename):
         if op in ['Add', 'Sub']:
             assert len(cur_node.input) == 2
 
-            b = _tensor_to_numpy(init)
-                # note shapes are not reversed here... acasxu input is 1, 1, 1, 5, but dim_value is 1, 1, 1, 5
-            shape = tuple(d for d in init.dims) # note dims reversed, acasxu has 5, 50 but want 5 cols
-            b = nn_unflatten(b, shape, order='F')
             # Determine which input is the "other" (not the main path activation).
             # For standard bias Add: one input is an initializer.
             # For skip-connection Add: both inputs are activations.

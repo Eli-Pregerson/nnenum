@@ -197,6 +197,7 @@ class LpStarState(Freezable):
                 # IntervalFallbackSafe is intentionally NOT caught here — let it propagate
                 # to the caller (worker.py / enumerate.py) where it's treated as "branch safe"
                 self.apply_linear_layer(network, spec=spec)
+
                 self.next_layer()
 
     def _maybe_cache_star(self, network):
@@ -258,7 +259,6 @@ class LpStarState(Freezable):
             self.prefilter.zono.pos1_gens = None
             self.prefilter.zono.neg1_gens = None
 
-        layer.transform_star(self.star)
         if isinstance(layer, SkipAddLayer):
             # Retrieve the cached skip-path star
             skip_source = network.dag_predecessors[self.cur_layer][0]
