@@ -387,6 +387,10 @@ def main():
     for init_box, spec in spec_list:
         init_box = np.array(init_box, dtype=input_dtype)
 
+        # vnnlib indexes inputs in CHW order (ONNX convention).
+        # nnenum layers expect HWC internally. Reorder once here at the interface boundary.
+        init_box = network.chw_to_hwc_init_box(init_box)
+
         if timeout is not None:
             if timeout <= 0:
                 result_str = 'timeout'

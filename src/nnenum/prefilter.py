@@ -231,7 +231,7 @@ class Prefilter(Freezable):
 
             if star.a_mat is not None:
                 input_tensor = input_tensor.astype(star.a_mat.dtype)
-                
+
             output_tensor = layer.execute(input_tensor)
             self.simulation[1] = nn_flatten(output_tensor)
 

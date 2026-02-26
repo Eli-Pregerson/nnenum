@@ -58,6 +58,12 @@ class Settings(metaclass=FreezableMeta):
         cls.PRINT_INTERVAL = 0.1 # print interval in seconds (0 = no printing)
         cls.TIMING_STATS = False # compute and print detailed timing stats
 
+        cls.LOG_CONV_BATCHING = False # log convolution batching statistics
+
+        cls.CONV_BATCHING_ENABLED = False # set to False to disable conv generator batching entirely
+        cls.CONV_BATCHING_MIN_SPARSITY = 0.05 # skip batching if generator sparsity > 5% (too dense)
+        cls.CONV_BATCHING_FIRST_LAYER_ONLY = False # only apply batching to first conv layer
+
         cls.CHECK_SINGLE_THREAD_BLAS = False
         # idea... replace this with threadpoolctl: https://github.com/joblib/threadpoolctl
         

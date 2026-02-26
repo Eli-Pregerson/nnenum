@@ -554,6 +554,7 @@ def load_onnx_network_optimized(filename):
             auto_pad = None
             pads = None
             strides = (1, 1)  # default
+            onnx_pads = None  # Explicit ONNX padding values
 
             for attr in cur_node.attribute:
                 if attr.name == 'auto_pad':
@@ -563,13 +564,30 @@ def load_onnx_network_optimized(filename):
                 elif attr.name == 'strides':
                     strides = tuple(attr.ints)
 
-            # Determine mode based on auto_pad or pads
+            # Determine mode and padding
             if auto_pad == 'VALID' or (pads and all(p == 0 for p in pads)):
                 mode = 'valid'
-            elif auto_pad in ['SAME_UPPER', 'SAME_LOWER', 'NOTSET'] or auto_pad is None:
+                onnx_pads = None  # No padding
+            elif auto_pad in ['SAME_UPPER', 'SAME_LOWER']:
                 mode = 'same'
+                onnx_pads = None  # Use scipy's auto-padding for 'same'
+            elif pads is not None and not all(p == 0 for p in pads):
+                # Explicit non-zero padding from ONNX
+                # ONNX pads format: [top, left, bottom, right] for 2D
+                # or [top_begin, left_begin, top_end, left_end] in general
+                if len(pads) == 4:
+                    onnx_pads = (pads[0], pads[1], pads[2], pads[3])  # [top, left, bottom, right]
+                else:
+                    # Fallback to 'same' if padding format is unexpected
+                    mode = 'same'
+                    onnx_pads = None
+            else:
+                # auto_pad is None or 'NOTSET' and no explicit pads - default to 'same'
+                mode = 'same'
+                onnx_pads = None
 
-            layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape, mode=mode, strides=strides)
+            layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape,
+                                        mode=mode, strides=strides, pads=onnx_pads)
         elif op == 'Reshape':
             assert len(cur_node.input) == 2, "Reshape should have 2 inputs (data and shape)"
 
@@ -619,11 +637,8 @@ def load_onnx_network_optimized(filename):
                 if new_size_without_batch == prev_size:
                     new_shape = new_shape[1:]
 
-            # Convert ONNX image format (C, H, W) to nnenum format (H, W, C)
-            if len(new_shape) == 3:
-                # Assume ONNX (channels, height, width) -> nnenum (height, width, channels)
-                new_shape = (new_shape[1], new_shape[2], new_shape[0])
-
+            # Keep ONNX CHW shape - ReshapeLayer.execute() will convert to HWC
+            # (conversion must happen during reshape, not just by changing shape tuple)
             layer = ReshapeLayer(len(layers), new_shape, prev_shape)
         elif op == 'BatchNormalization':
             # Fold BatchNorm into previous Conv or FC layer

@@ -701,8 +701,7 @@ class Worker(Freezable):
                     cinput, _ = res
 
                     full_cinput_flat = star.to_full_input(cinput)
-                    full_cinput = nn_unflatten(full_cinput_flat, self.shared.network.get_input_shape())
-                    exec_output, exec_branch_list = self.shared.network.execute(full_cinput, save_branching=True)
+                    exec_output, exec_branch_list = self.shared.network.execute(full_cinput_flat, save_branching=True)
                     exec_output = nn_flatten(exec_output)
 
                     if branch_list_in_branch_tuples(exec_branch_list, branch_tuples):

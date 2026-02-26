@@ -125,6 +125,61 @@ Core: numpy, scipy, onnx, onnxruntime, skl2onnx, swiglpk (GLPK), termcolor
 
 See `requirements.txt` for complete list.
 
+## Convolution Optimization (Generator Batching)
+
+**Added**: 2025-02-24
+
+A significant optimization for convolutional layers that batches sparse generators to reduce the number of convolution operations.
+
+### Key Insight
+
+In image verification, initial generators are typically one-hot vectors (one per input pixel-channel). For a 32×32×3 CIFAR image, this means 3072 extremely sparse generators. Without optimization, each generator requires a separate convolution operation (3072 convolutions per layer).
+
+Since convolution is **linear** (`conv(a + b) = conv(a) + conv(b)`) and generators with non-overlapping regions produce non-overlapping outputs, we can:
+1. **Batch** generators whose output regions don't overlap
+2. **Combine** them into a single tensor
+3. Perform **one convolution** instead of N
+4. **Extract** each generator's contribution by masking its output region
+
+### Implementation
+
+**Location**: `src/nnenum/network.py` - `Convolutional2dLayer` class
+
+**Methods**:
+- `_compute_output_region()` - Maps input nonzero region to output region after convolution
+- `_batch_generators_for_conv()` - Greedy batching algorithm that groups non-conflicting generators
+- Modified `transform_star()` and `transform_zono()` - Apply batching with adaptive threshold
+
+**Adaptive Batching**: The optimization automatically skips batching when generators are too dense:
+- Checks sparsity: `nonzeros / total_elements`
+- If sparsity > `Settings.CONV_BATCHING_MIN_SPARSITY` (default 5%), uses unbatched path
+- Avoids overhead when batching won't help (later conv layers)
+
+### Performance
+
+**CIFAR-scale (32×32×3)**:
+- **First conv layer**: 3072 generators → 27 batches (~114x compression) → **4.7x speedup**
+- **Second conv layer**: Generators become denser (~0.6% sparsity) → 5.3x compression → still beneficial
+- **Third conv layer**: Further degradation (~1.4% sparsity) → 4.0x compression → marginal benefit
+- **Dense layers** (>5% sparsity): Batching skipped automatically to avoid overhead
+
+### Settings
+
+```python
+from nnenum.settings import Settings
+
+# Enable logging to see batching statistics
+Settings.LOG_CONV_BATCHING = True
+
+# Adjust sparsity threshold (default: 0.05 = 5%)
+Settings.CONV_BATCHING_MIN_SPARSITY = 0.02  # More aggressive
+
+# Only batch first conv layer (for very deep networks)
+Settings.CONV_BATCHING_FIRST_LAYER_ONLY = True
+```
+
+**Recommendation**: Use defaults. The adaptive sparsity check handles most cases automatically.
+
 ## VNN-COMP 2025 Benchmark Results
 
 The `vnncomp2025_benchmarks/` directory contains critical performance data:

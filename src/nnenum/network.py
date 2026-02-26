@@ -70,6 +70,40 @@ class NeuralNetwork(Freezable):
 
         return self.layers[-1].get_output_shape()
 
+    def chw_to_hwc_init_box(self, init_box):
+        '''Convert a flat init_box from CHW order (ONNX/vnnlib convention) to HWC order (nnenum internal convention).
+
+        vnnlib specifies input bounds indexed in CHW-flat order.
+        nnenum's internal layers expect HWC layout.
+        This function reorders the rows of init_box so that index i refers to the i-th element in HWC-flat order.
+
+        Only applied when the first layer has a 3D (H, W, C) input shape.
+        For 1D inputs (FC networks), no reordering is needed.
+
+        Returns a new array with the same shape as init_box, reordered if necessary.
+        '''
+
+        input_shape = self.get_input_shape()
+
+        if len(input_shape) != 3:
+            return init_box  # 1D input: no reordering needed
+
+        h, w, c = input_shape
+        # CHW-flat index i corresponds to: channel = i // (h*w), row = (i % (h*w)) // w, col = i % w
+        # HWC-flat index j corresponds to: row = j // (w*c), col = (j % (w*c)) // c, channel = j % c
+        # Build the permutation: for each HWC-flat index j, find the CHW-flat index of the same element.
+        # HWC element (r, col, ch) has HWC-flat index = r*w*c + col*c + ch
+        #                           and CHW-flat index = ch*h*w + r*w + col
+        chw_indices = np.empty(h * w * c, dtype=int)
+        for r in range(h):
+            for col in range(w):
+                for ch in range(c):
+                    hwc_idx = r * w * c + col * c + ch
+                    chw_idx = ch * h * w + r * w + col
+                    chw_indices[hwc_idx] = chw_idx
+
+        return init_box[chw_indices]
+
     def get_num_inputs(self):
         'get the scalar number of inputs'
 
@@ -109,7 +143,7 @@ class NeuralNetwork(Freezable):
             branch_list = []
 
         state = input_vec.copy() # test with float32 dtype?
-        
+
         if state.shape != self.get_input_shape():
             state = nn_unflatten(state, self.get_input_shape())
 
@@ -331,6 +365,12 @@ class FlattenLayer(Freezable):
         returns output
         '''
 
+        # ONNX Flatten expects CHW format, but nnenum uses HWC
+        # Need to convert HWC (H, W, C) → CHW (C, H, W) before flattening
+        if len(state.shape) == 3:
+            # Convert from HWC to CHW
+            state = np.transpose(state, (2, 0, 1))
+
         rv = nn_flatten(state)
         assert rv.shape == self.output_shape
 
@@ -384,7 +424,12 @@ class ReshapeLayer(Freezable):
     def get_output_shape(self):
         'get the output shape from this layer'
 
-        return self.new_shape
+        # For 3D shapes, return HWC format (transpose of stored CHW)
+        if len(self.new_shape) == 3:
+            # CHW → HWC: (C, H, W) → (H, W, C)
+            return (self.new_shape[1], self.new_shape[2], self.new_shape[0])
+        else:
+            return self.new_shape
 
     def transform_star(self, star):
         'transform the star for this layer'
@@ -407,8 +452,17 @@ class ReshapeLayer(Freezable):
         returns output
         '''
 
-        rv = state.reshape(self.new_shape)
-        assert rv.shape == self.new_shape
+        # For 3D shapes, ONNX uses CHW format but nnenum uses HWC
+        # Must reshape to CHW first, then transpose to HWC
+        if len(self.new_shape) == 3:
+            # Reshape to ONNX CHW format
+            state_chw = state.reshape(self.new_shape)
+            # Convert CHW → HWC
+            rv = np.transpose(state_chw, (1, 2, 0))
+        else:
+            # Non-3D reshape
+            rv = state.reshape(self.new_shape)
+            assert rv.shape == self.new_shape
 
         return rv
 
@@ -720,12 +774,15 @@ class Convolutional2dLayer(Freezable):
     outputs multi-channel 2d data
     '''
 
-    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='same', boundary='fill', strides=(1, 1)):
+    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='same', boundary='fill', strides=(1, 1), pads=None):
         self.layer_num = layer_num
         self.biases = biases
         self.mode = mode
         self.boundary = boundary
         self.strides = strides if isinstance(strides, tuple) else (strides, strides)
+        # Store explicit padding values for ONNX compatibility
+        # pads format: [top, left, bottom, right] or None for auto-padding based on mode
+        self.pads = pads
 
         assert isinstance(prev_layer_output_shape, tuple), f"prev_layer_shape was {prev_layer_output_shape}"
 
@@ -780,7 +837,16 @@ class Convolutional2dLayer(Freezable):
         kernel_h = self.kernels[0][0].shape[0]
         kernel_w = self.kernels[0][0].shape[1]
 
-        if self.mode == 'valid':
+        if self.pads is not None:
+            # ONNX explicit padding: pads = [top, left, bottom, right]
+            top, left, bottom, right = self.pads
+            # Add padding to input size
+            padded_height = height + top + bottom
+            padded_width = width + left + right
+            # Calculate output size with 'valid' convolution on padded input
+            height = (padded_height - kernel_h) // self.strides[0] + 1
+            width = (padded_width - kernel_w) // self.strides[1] + 1
+        elif self.mode == 'valid':
             height = (height - kernel_h) // self.strides[0] + 1
             width = (width - kernel_w) // self.strides[1] + 1
         else:  # mode == 'same'
@@ -789,22 +855,272 @@ class Convolutional2dLayer(Freezable):
 
         return (height, width, depth)
 
+    def _compute_output_region(self, input_region, kernel_size):
+        """
+        Compute the output region affected by an input region after convolution.
+
+        For 'same' padding, the output region is expanded by approximately kernel_size//2 in each direction.
+        For 'valid' padding, the output region is shrunk.
+        For explicit ONNX padding, account for the actual pad values.
+
+        Returns: (out_min_y, out_max_y, out_min_x, out_max_x) or None
+        """
+        if input_region is None:
+            return None
+
+        min_y, max_y, min_x, max_x = input_region
+        output_shape = self.get_output_shape()
+        stride_y, stride_x = self.strides
+
+        if self.pads is not None:
+            # ONNX explicit padding: pads = [top, left, bottom, right]
+            top, left, bottom, right = self.pads
+
+            # Input region is in original (unpadded) coordinates
+            # Convert to padded coordinates
+            padded_min_y = min_y + top
+            padded_max_y = max_y + top
+            padded_min_x = min_x + left
+            padded_max_x = max_x + left
+
+            # Now compute output region using 'valid' mode logic on padded input
+            # Output pixel (oy, ox) depends on padded input [oy*stride : oy*stride + kernel_size - 1]
+            # We want output pixels whose receptive field overlaps [padded_min_y, padded_max_y]
+
+            # First output pixel affected
+            out_min_y = max(0, (padded_min_y - kernel_size + stride_y) // stride_y)
+            out_max_y = min(output_shape[0] - 1, padded_max_y // stride_y)
+            out_min_x = max(0, (padded_min_x - kernel_size + stride_x) // stride_x)
+            out_max_x = min(output_shape[1] - 1, padded_max_x // stride_x)
+
+        elif self.mode == 'same':
+            # For 'same' mode, each input pixel affects a region of size ~kernel_size in output
+            padding = kernel_size // 2
+
+            # Convert input coordinates to output coordinates (accounting for stride)
+            out_min_y = max(0, (min_y - padding) // stride_y)
+            out_max_y = min(output_shape[0] - 1, (max_y + padding) // stride_y)
+            out_min_x = max(0, (min_x - padding) // stride_x)
+            out_max_x = min(output_shape[1] - 1, (max_x + padding) // stride_x)
+        else:  # 'valid' mode
+            # For valid mode, output is smaller
+            # Output pixel (i, j) depends on input region [i*stride : i*stride + kernel_size, j*stride : j*stride + kernel_size]
+
+            # Find output pixels affected by input region [min_y:max_y+1, min_x:max_x+1]
+            # Output pixel (oy, ox) is affected if its receptive field overlaps [min_y, max_y]
+            #   Receptive field: [oy * stride_y, oy * stride_y + kernel_size - 1]
+
+            # First output pixel affected: ceil((min_y - kernel_size + 1) / stride_y)
+            out_min_y = max(0, (min_y - kernel_size + stride_y) // stride_y)
+            out_max_y = min(output_shape[0] - 1, max_y // stride_y)
+            out_min_x = max(0, (min_x - kernel_size + stride_x) // stride_x)
+            out_max_x = min(output_shape[1] - 1, max_x // stride_x)
+
+        return (out_min_y, out_max_y, out_min_x, out_max_x)
+
+    def _batch_generators_for_conv(self, mat, shape):
+        """
+        Group generator columns that won't interact during convolution into batches.
+
+        For sparse generators, we can combine multiple generators whose nonzero regions
+        are separated by at least the kernel size, perform convolution once on the batch,
+        then separate them back out.
+
+        Returns: list of batches, where each batch is a dict:
+            {
+                'indices': list of column indices in this batch,
+                'input_regions': list of (min_y, max_y, min_x, max_x) tuples for input nonzero regions,
+                'output_regions': list of (min_y, max_y, min_x, max_x) tuples for output regions
+            }
+        """
+        Timers.tic('batch_generators_for_conv')
+
+        height, width, channels = shape
+        kernel_size = self.kernels[0][0].shape[0]  # Assume square kernels
+
+        # For each generator, find its nonzero bounding box
+        generator_info = []
+        for cindex in range(mat.shape[1]):
+            column = mat[:, cindex]
+
+            # Find nonzero region in 2D space (considering all channels)
+            multichannel = nn_unflatten(column, shape)
+
+            # Find bounding box across all channels
+            nonzero_indices = np.nonzero(multichannel)
+            if len(nonzero_indices[0]) > 0:
+                min_y, max_y = nonzero_indices[0].min(), nonzero_indices[0].max()
+                min_x, max_x = nonzero_indices[1].min(), nonzero_indices[1].max()
+                input_region = (min_y, max_y, min_x, max_x)
+            else:
+                input_region = None
+
+            # Compute output region
+            output_region = self._compute_output_region(input_region, kernel_size)
+
+            generator_info.append({
+                'index': cindex,
+                'input_region': input_region,
+                'output_region': output_region,
+                'column': column
+            })
+
+        # Greedy batching: assign each generator to first compatible batch
+        batches = []
+
+        def output_regions_overlap(region1, region2):
+            """Check if two output regions overlap"""
+            if region1 is None or region2 is None:
+                return False
+
+            min_y1, max_y1, min_x1, max_x1 = region1
+            min_y2, max_y2, min_x2, max_x2 = region2
+
+            y_overlap = not (max_y1 < min_y2 or max_y2 < min_y1)
+            x_overlap = not (max_x1 < min_x2 or max_x2 < min_x1)
+
+            return y_overlap and x_overlap
+
+        for gen_info in generator_info:
+            # Try to add to existing batch
+            placed = False
+            for batch in batches:
+                # Check if this generator's output region conflicts with any generator in the batch
+                conflicts = False
+                for out_region in batch['output_regions']:
+                    if output_regions_overlap(gen_info['output_region'], out_region):
+                        conflicts = True
+                        break
+
+                if not conflicts:
+                    # Add to this batch
+                    batch['indices'].append(gen_info['index'])
+                    batch['input_regions'].append(gen_info['input_region'])
+                    batch['output_regions'].append(gen_info['output_region'])
+                    placed = True
+                    break
+
+            if not placed:
+                # Create new batch
+                batches.append({
+                    'indices': [gen_info['index']],
+                    'input_regions': [gen_info['input_region']],
+                    'output_regions': [gen_info['output_region']]
+                })
+
+        # Optional logging
+        from nnenum.settings import Settings
+        if Settings.LOG_CONV_BATCHING:
+            num_gens = mat.shape[1]
+            num_batches = len(batches)
+            batch_sizes = [len(b['indices']) for b in batches]
+            compression_ratio = num_gens / num_batches if num_batches > 0 else 0
+            print(f"[Conv Batching L{self.layer_num}] {num_gens} gens → {num_batches} batches " +
+                  f"(ratio: {compression_ratio:.2f}x, mean batch size: {np.mean(batch_sizes):.1f})")
+
+        Timers.toc('batch_generators_for_conv')
+        return batches, generator_info
+
     def transform_star(self, star):
         'apply the linear transformation part of the layer to the passed-in lp_star (not relu)'
 
         shape = self.get_input_shape()
 
-        # a_mat has one generator PER COLUMN
-        result_columns = []
+        # Check if batching is likely to be beneficial
+        from nnenum.settings import Settings
+        should_batch = True
 
-        for cindex in range(star.a_mat.shape[1]):
-            column = star.a_mat[:, cindex]
+        if not Settings.CONV_BATCHING_ENABLED:
+            should_batch = False
+        elif Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
+            should_batch = False
+        elif star.a_mat.shape[1] > 0:
+            # Check sparsity of first generator only (assumes uniform sparsity)
+            # This avoids the overhead of checking the entire matrix
+            first_gen_sparsity = np.count_nonzero(star.a_mat[:, 0]) / star.a_mat.shape[0]
+            if first_gen_sparsity > Settings.CONV_BATCHING_MIN_SPARSITY:
+                should_batch = False
 
-            multichannel_state = nn_unflatten(column, shape)
-            multichannel_state = self.execute(multichannel_state, zero_bias=True)
+        if not should_batch:
+            # Use original unoptimized path
+            Timers.tic('transform_star_unbatched')
+            result_columns = []
+            for cindex in range(star.a_mat.shape[1]):
+                column = star.a_mat[:, cindex]
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state, zero_bias=True)
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns.append(flat)
+            star.a_mat = np.hstack(result_columns)
+
+            # bias transformation
+            multichannel_state = nn_unflatten(star.bias, shape)
+            multichannel_state = self.execute(multichannel_state)
             flat = nn_flatten(multichannel_state)
-            flat.shape = (flat.size, 1)
-            result_columns.append(flat)
+            star.bias = flat
+            Timers.toc('transform_star_unbatched')
+
+            assert star.bias.size == star.a_mat.shape[0]
+            return
+
+        # Batch generators to reduce convolution operations
+        batches, generator_info = self._batch_generators_for_conv(star.a_mat, shape)
+
+        Timers.tic('transform_star_batched_conv')
+
+        # Process each batch
+        result_columns = [None] * star.a_mat.shape[1]
+
+        for batch in batches:
+            if len(batch['indices']) == 1:
+                # Single generator - process normally
+                idx = batch['indices'][0]
+                column = generator_info[idx]['column']
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state, zero_bias=True)
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns[idx] = flat
+            else:
+                # Multiple non-conflicting generators - combine, convolve once, separate
+                # Key insight: convolution is linear, so conv(sum(g_i)) = sum(conv(g_i))
+                # Since output regions don't overlap, we can extract each contribution by masking
+
+                # Combine generators in this batch
+                combined = np.zeros(shape, dtype=star.a_mat.dtype)
+
+                for idx in batch['indices']:
+                    column = generator_info[idx]['column']
+                    multichannel_state = nn_unflatten(column, shape)
+                    combined += multichannel_state
+
+                # Perform ONE convolution on combined batch
+                combined_result = self.execute(combined, zero_bias=True)
+                combined_result_2d = combined_result  # Shape: (height, width, channels)
+
+                # Extract each generator's contribution using output regions
+                output_shape = self.get_output_shape()
+
+                for i, idx in enumerate(batch['indices']):
+                    output_region = batch['output_regions'][i]
+
+                    if output_region is None:
+                        # Zero generator
+                        flat = np.zeros((np.prod(output_shape), 1), dtype=star.a_mat.dtype)
+                        result_columns[idx] = flat
+                    else:
+                        # Extract output region for this generator
+                        out_min_y, out_max_y, out_min_x, out_max_x = output_region
+
+                        # Create masked output: zero everywhere except this generator's region
+                        masked_output = np.zeros(output_shape, dtype=star.a_mat.dtype)
+                        masked_output[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :] = \
+                            combined_result_2d[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :]
+
+                        flat = nn_flatten(masked_output)
+                        flat.shape = (flat.size, 1)
+                        result_columns[idx] = flat
 
         star.a_mat = np.hstack(result_columns)
 
@@ -814,6 +1130,8 @@ class Convolutional2dLayer(Freezable):
         flat = nn_flatten(multichannel_state)
         star.bias = flat
 
+        Timers.toc('transform_star_batched_conv')
+
         assert star.bias.size == star.a_mat.shape[0]
 
     def transform_zono(self, zono):
@@ -822,18 +1140,99 @@ class Convolutional2dLayer(Freezable):
         # mat_t has one generator PER COLUMN
         shape = self.get_input_shape()
 
-        result_columns = []
+        # Check if batching is likely to be beneficial
+        from nnenum.settings import Settings
+        should_batch = True
 
-        for cindex in range(zono.mat_t.shape[1]):
-            column = zono.mat_t[:, cindex]
+        if not Settings.CONV_BATCHING_ENABLED:
+            should_batch = False
+        elif Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
+            should_batch = False
+        elif zono.mat_t.shape[1] > 0:
+            # Check sparsity of first generator only (assumes uniform sparsity)
+            # This avoids the overhead of checking the entire matrix
+            first_gen_sparsity = np.count_nonzero(zono.mat_t[:, 0]) / zono.mat_t.shape[0]
+            if first_gen_sparsity > Settings.CONV_BATCHING_MIN_SPARSITY:
+                should_batch = False
 
-            multichannel_state = nn_unflatten(column, shape)
-            multichannel_state = self.execute(multichannel_state, zero_bias=True)
+        if not should_batch:
+            # Use original unoptimized path
+            Timers.tic('transform_zono_unbatched')
+            result_columns = []
+            for cindex in range(zono.mat_t.shape[1]):
+                column = zono.mat_t[:, cindex]
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state, zero_bias=True)
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns.append(flat)
+            zono.mat_t = np.hstack(result_columns)
 
+            # center transformation
+            multichannel_state = nn_unflatten(zono.center, shape)
+            multichannel_state = self.execute(multichannel_state)
             flat = nn_flatten(multichannel_state)
-            flat.shape = (flat.size, 1)
-            result_columns.append(flat)
-            
+            zono.center = flat
+            Timers.toc('transform_zono_unbatched')
+
+            assert zono.center.size == zono.mat_t.shape[0]
+            return
+
+        # Batch generators to reduce convolution operations
+        batches, generator_info = self._batch_generators_for_conv(zono.mat_t, shape)
+
+        Timers.tic('transform_zono_batched_conv')
+
+        # Process each batch
+        result_columns = [None] * zono.mat_t.shape[1]
+
+        for batch in batches:
+            if len(batch['indices']) == 1:
+                # Single generator - process normally
+                idx = batch['indices'][0]
+                column = generator_info[idx]['column']
+                multichannel_state = nn_unflatten(column, shape)
+                multichannel_state = self.execute(multichannel_state, zero_bias=True)
+                flat = nn_flatten(multichannel_state)
+                flat.shape = (flat.size, 1)
+                result_columns[idx] = flat
+            else:
+                # Multiple non-conflicting generators - combine, convolve once, separate
+                # Combine generators in this batch
+                combined = np.zeros(shape, dtype=zono.mat_t.dtype)
+
+                for idx in batch['indices']:
+                    column = generator_info[idx]['column']
+                    multichannel_state = nn_unflatten(column, shape)
+                    combined += multichannel_state
+
+                # Perform ONE convolution on combined batch
+                combined_result = self.execute(combined, zero_bias=True)
+                combined_result_2d = combined_result
+
+                # Extract each generator's contribution using output regions
+                output_shape = self.get_output_shape()
+
+                for i, idx in enumerate(batch['indices']):
+                    output_region = batch['output_regions'][i]
+
+                    if output_region is None:
+                        # Zero generator
+                        flat = np.zeros((np.prod(output_shape), 1), dtype=zono.mat_t.dtype)
+                        result_columns[idx] = flat
+                    else:
+                        # Extract output region for this generator
+                        out_min_y, out_max_y, out_min_x, out_max_x = output_region
+
+                        # Create masked output
+                        masked_output = np.zeros(output_shape, dtype=zono.mat_t.dtype)
+                        masked_output[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :] = \
+                            combined_result_2d[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :]
+
+                        flat = nn_flatten(masked_output)
+                        flat.shape = (flat.size, 1)
+                        result_columns[idx] = flat
+
         zono.mat_t = np.hstack(result_columns)
 
         # center transformation includes layer bias
@@ -841,6 +1240,8 @@ class Convolutional2dLayer(Freezable):
         multichannel_state = self.execute(multichannel_state)
         flat = nn_flatten(multichannel_state)
         zono.center = flat
+
+        Timers.toc('transform_zono_batched_conv')
 
         assert zono.center.size == zono.mat_t.shape[0]
 
@@ -860,6 +1261,20 @@ class Convolutional2dLayer(Freezable):
         assert state.shape == self.prev_layer_output_shape, f"expected shape {self.prev_layer_output_shape}, " + \
                                                             f"got {state.shape}"
 
+        # Handle explicit padding (ONNX pads) vs auto-padding (scipy mode)
+        if self.pads is not None:
+            # ONNX explicit padding: pads = [top, left, bottom, right]
+            # Pad the input state first
+            top, left, bottom, right = self.pads
+            # state shape: (height, width, channels)
+            # Pad only spatial dimensions (height, width), not channels
+            state_padded = np.pad(state, ((top, bottom), (left, right), (0, 0)), mode='constant', constant_values=0)
+            conv_mode = 'valid'  # Use valid mode after explicit padding
+        else:
+            # Use scipy's auto-padding based on mode
+            state_padded = state
+            conv_mode = self.mode
+
         output = []
         output_shape = self.get_output_shape()
 
@@ -867,15 +1282,15 @@ class Convolutional2dLayer(Freezable):
             out = np.empty(output_shape[:-1])
 
             bias = bias if not zero_bias else 0
-            
+
             out.fill(bias)
             output.append(out)
 
             for i, channel_kernel in enumerate(kernel):
                 # depth is last channel (bad for convolution performance I think)
-                state2d = state[:, :, i]
+                state2d = state_padded[:, :, i]
                 Timers.tic('convolve2d')
-                channel_out = convolve2d(state2d, channel_kernel, mode=self.mode, boundary=self.boundary)
+                channel_out = convolve2d(state2d, channel_kernel, mode=conv_mode, boundary=self.boundary)
                 Timers.toc('convolve2d')
 
                 Timers.tic('add')
