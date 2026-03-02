@@ -11,6 +11,23 @@ from scipy.signal import convolve2d
 from nnenum.util import Freezable
 from nnenum.timerutil import Timers
 
+def _hwc_to_chw_permutation(h, w, c):
+    '''Compute the permutation that reorders HWC-flat indices to CHW-flat indices.
+
+    After Conv layers, nnenum stores star/zono data in HWC-flat order.
+    ONNX FC weight matrices (MatMul/Gemm) index inputs in CHW-flat order.
+    This permutation maps CHW-flat position k to the HWC-flat index of the same element,
+    so that `data[perm]` converts from HWC-flat to CHW-flat row ordering.
+    '''
+    perm = np.empty(h * w * c, dtype=int)
+    for ch in range(c):
+        for r in range(h):
+            for col in range(w):
+                chw_idx = ch * h * w + r * w + col
+                hwc_idx = r * w * c + col * c + ch
+                perm[chw_idx] = hwc_idx
+    return perm
+
 class NeuralNetwork(Freezable):
     'neural network container'
 
@@ -347,12 +364,25 @@ class FlattenLayer(Freezable):
     def transform_star(self, star):
         'transform the star for this layer'
 
-        # do nothing
+        if len(self.input_shape) == 3:
+            # Input is 3D HWC. After Conv, star rows are in HWC-flat order.
+            # FC weight matrices (next layer) expect CHW-flat ordering.
+            # Permute rows to convert HWC-flat to CHW-flat.
+            h, w, c = self.input_shape
+            perm = _hwc_to_chw_permutation(h, w, c)
+            star.bias = star.bias[perm]
+            if star.a_mat is not None:
+                star.a_mat = star.a_mat[perm, :]
 
     def transform_zono(self, zono):
         'transform the zono for this layer'
 
-        # do nothing
+        if len(self.input_shape) == 3:
+            h, w, c = self.input_shape
+            perm = _hwc_to_chw_permutation(h, w, c)
+            zono.center = zono.center[perm]
+            if zono.mat_t is not None:
+                zono.mat_t = zono.mat_t[perm, :]
 
     def transform_deeppoly(self, deeppoly):
         'transform the deeppoly for this layer'
@@ -434,12 +464,25 @@ class ReshapeLayer(Freezable):
     def transform_star(self, star):
         'transform the star for this layer'
 
-        # do nothing - reshape doesn't change the abstract representation
+        if len(self.input_shape) == 3 and len(self.new_shape) == 1:
+            # Flattening from 3D HWC to 1D: permute rows HWC-flat → CHW-flat
+            # so subsequent FC weight matrices (CHW-indexed) are applied correctly.
+            h, w, c = self.input_shape
+            perm = _hwc_to_chw_permutation(h, w, c)
+            star.bias = star.bias[perm]
+            if star.a_mat is not None:
+                star.a_mat = star.a_mat[perm, :]
+        # For other cases (flat→flat, flat→3D), no row permutation needed.
 
     def transform_zono(self, zono):
         'transform the zono for this layer'
 
-        # do nothing - reshape doesn't change the abstract representation
+        if len(self.input_shape) == 3 and len(self.new_shape) == 1:
+            h, w, c = self.input_shape
+            perm = _hwc_to_chw_permutation(h, w, c)
+            zono.center = zono.center[perm]
+            if zono.mat_t is not None:
+                zono.mat_t = zono.mat_t[perm, :]
 
     def transform_deeppoly(self, deeppoly):
         'transform the deeppoly for this layer'
@@ -452,15 +495,16 @@ class ReshapeLayer(Freezable):
         returns output
         '''
 
-        # For 3D shapes, ONNX uses CHW format but nnenum uses HWC
-        # Must reshape to CHW first, then transpose to HWC
         if len(self.new_shape) == 3:
-            # Reshape to ONNX CHW format
+            # 3D output: ONNX target shape is CHW. Reshape to CHW then transpose to HWC.
             state_chw = state.reshape(self.new_shape)
-            # Convert CHW → HWC
             rv = np.transpose(state_chw, (1, 2, 0))
+        elif len(state.shape) == 3:
+            # Flattening from 3D HWC input: must convert HWC→CHW before flattening,
+            # so the flat ordering matches what ONNX FC weights expect (CHW-indexed).
+            state_chw = np.transpose(state, (2, 0, 1))
+            rv = state_chw.reshape(self.new_shape)
         else:
-            # Non-3D reshape
             rv = state.reshape(self.new_shape)
             assert rv.shape == self.new_shape
 

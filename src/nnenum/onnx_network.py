@@ -627,14 +627,21 @@ def load_onnx_network_optimized(filename):
                 prev_size *= d
 
             # Check if new_shape has batch dimension (first dim is 1 or -1)
-            if len(new_shape) >= 2:
-                # Calculate size without first dimension
-                new_size_without_batch = 1
+            if len(new_shape) >= 2 and new_shape[0] in (1, -1):
+                # Calculate size without first dimension, treating -1 as a wildcard
+                known_size = 1
+                has_wildcard = False
                 for d in new_shape[1:]:
-                    new_size_without_batch *= d
+                    if d == -1:
+                        has_wildcard = True
+                    else:
+                        known_size *= d
 
-                # If sizes match, first dim is batch - strip it
-                if new_size_without_batch == prev_size:
+                # Strip batch dim if:
+                # - sizes match exactly (no wildcard), OR
+                # - there's a wildcard and known dims divide prev_size (wildcard would cover the rest)
+                if (not has_wildcard and known_size == prev_size) or \
+                   (has_wildcard and known_size > 0 and prev_size % known_size == 0):
                     new_shape = new_shape[1:]
 
             # Keep ONNX CHW shape - ReshapeLayer.execute() will convert to HWC
