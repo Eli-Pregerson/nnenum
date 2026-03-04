@@ -15,7 +15,7 @@ import onnxruntime as ort
 from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_model_inputs_outputs
 from onnx.helper import ValueInfoProto, make_graph, make_model
 
-from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer
+from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer, ScaleLayer
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
@@ -588,6 +588,10 @@ def load_onnx_network_optimized(filename):
 
             layer = Convolutional2dLayer(len(layers), kernels, biases, prev_shape,
                                         mode=mode, strides=strides, pads=onnx_pads)
+        # ConvTranspose support disabled — falls back to general (onnxruntime) path.
+        # Re-enable when conv optimizations are extended to ConvTranspose (see GOALS.md #2).
+        # elif op == 'ConvTranspose':
+        #     ...
         elif op == 'Reshape':
             assert len(cur_node.input) == 2, "Reshape should have 2 inputs (data and shape)"
 
@@ -648,9 +652,10 @@ def load_onnx_network_optimized(filename):
             # (conversion must happen during reshape, not just by changing shape tuple)
             layer = ReshapeLayer(len(layers), new_shape, prev_shape)
         elif op == 'BatchNormalization':
-            # Fold BatchNorm into previous Conv or FC layer
+            # Fold BatchNorm into previous Conv or FC layer when possible.
             # BatchNorm: y = scale * (x - mean) / sqrt(var + epsilon) + bias
             # This can be folded as: y = (scale / sqrt(var + eps)) * x + (bias - mean * scale / sqrt(var + eps))
+            # When folding is not possible, create a standalone ScaleLayer.
 
             assert len(layers) > 0, "BatchNormalization cannot be the first layer"
             prev_layer = layers[-1]
@@ -678,7 +683,9 @@ def load_onnx_network_optimized(filename):
             bn_scale = scale / np.sqrt(var + epsilon)
             bn_shift = bias - mean * bn_scale
 
-            # Fold into previous layer
+            # Default: no new layer (folded case)
+            layer = None
+
             if isinstance(prev_layer, Convolutional2dLayer):
                 # For Conv: scale each output channel's kernel and bias
                 # prev_layer.kernels is list[list[2D array]]: kernels[out_ch][in_ch] = 2D kernel
@@ -692,6 +699,9 @@ def load_onnx_network_optimized(filename):
                 for out_c in range(num_out_channels):
                     for in_c in range(len(prev_layer.kernels[out_c])):
                         prev_layer.kernels[out_c][in_c] = prev_layer.kernels[out_c][in_c] * bn_scale[out_c]
+
+                # kernels_array stores unflipped weights; scale each output channel row
+                prev_layer.kernels_array = prev_layer.kernels_array * bn_scale[:, np.newaxis, np.newaxis, np.newaxis].astype(prev_layer.kernels_array.dtype)
 
                 # Update biases: create new bias array (b_new = bn_scale * b_old + bn_shift)
                 prev_layer.biases = bn_scale * prev_layer.biases + bn_shift
@@ -712,10 +722,27 @@ def load_onnx_network_optimized(filename):
                 prev_layer.biases = bn_scale * prev_layer.biases + bn_shift
 
             else:
-                raise RuntimeError(f"BatchNormalization can only follow Conv or FC layers, got {type(prev_layer).__name__}")
+                # Cannot fold into previous layer — create a standalone ScaleLayer instead.
+                # Handles BatchNorm after Reshape, ReLU, Add, or any other non-parameterized layer.
+                prev_output_shape = prev_layer.get_output_shape()
 
-            # Don't create a new layer - BatchNorm is now folded into previous layer
-            layer = None
+                if len(prev_output_shape) == 3:
+                    # 3D HWC output: BN params are per-channel (C = last dim in HWC)
+                    h, w, c = prev_output_shape
+                    assert len(bn_scale) == c, \
+                        f"BatchNorm scale size {len(bn_scale)} doesn't match output channels {c}"
+                    # Broadcast per-channel values to full HWC-flat vector
+                    flat_scale = np.broadcast_to(bn_scale, (h, w, c)).reshape(-1).astype(np.float64)
+                    flat_shift = np.broadcast_to(bn_shift, (h, w, c)).reshape(-1).astype(np.float64)
+                else:
+                    # 1D or other flat output: BN params must match flat size
+                    flat_size = int(np.prod(prev_output_shape))
+                    assert len(bn_scale) == flat_size, \
+                        f"BatchNorm scale size {len(bn_scale)} doesn't match output size {flat_size}"
+                    flat_scale = bn_scale.astype(np.float64)
+                    flat_shift = bn_shift.astype(np.float64)
+
+                layer = ScaleLayer(len(layers), flat_scale, flat_shift, prev_output_shape)
         else:
             assert False, f"unsupported onnx op_type {op} in node {cur_node.name}"
 

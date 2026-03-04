@@ -327,6 +327,9 @@ def test_batchnorm_folding(results):
     # Update biases
     conv_layer.biases = bn_scale * biases + bn_shift
 
+    # Update kernels_array (stores unflipped kernels; scale per output channel)
+    conv_layer.kernels_array = conv_layer.kernels_array * bn_scale[:, np.newaxis, np.newaxis, np.newaxis].astype(conv_layer.kernels_array.dtype)
+
     # Test 1a: Check kernels were scaled correctly
     results.record(
         "BatchNorm folding - kernel scaling",

@@ -6,7 +6,7 @@ Network container classes for nnenum
 
 import numpy as np
 import onnx
-from scipy.signal import convolve2d
+from scipy.signal import convolve2d, fftconvolve
 
 from nnenum.util import Freezable
 from nnenum.timerutil import Timers
@@ -575,6 +575,62 @@ class AddLayer(Freezable):
 
         return state + self.vec
 
+class ScaleLayer(Freezable):
+    'element-wise scale and shift: y = scale * x + shift (e.g. standalone BatchNorm)'
+
+    def __init__(self, layer_num, scale, shift, input_shape):
+        assert scale.shape == shift.shape
+        assert scale.ndim == 1
+
+        self.layer_num = layer_num
+        self.scale = scale      # 1D, flattened order matching the layer's flat representation
+        self.shift = shift      # 1D
+        self.input_shape = input_shape
+        self.network = None
+
+        self.freeze_attrs()
+
+    def __str__(self):
+        return f'[ScaleLayer with shape {self.input_shape}]'
+
+    def get_input_shape(self):
+        return self.input_shape
+
+    def get_output_shape(self):
+        return self.input_shape
+
+    def transform_star(self, star):
+        star.a_mat = star.a_mat * self.scale[:, np.newaxis]
+        star.bias = star.bias * self.scale + self.shift
+
+    def transform_zono(self, zono):
+        zono.mat_t = zono.mat_t * self.scale[:, np.newaxis]
+        zono.center = zono.center * self.scale + self.shift
+
+    def transform_deeppoly(self, deeppoly):
+        # ScaleLayer is a diagonal linear map: y = diag(scale)*x + shift
+        pos = np.maximum(self.scale, 0)
+        neg = np.minimum(self.scale, 0)
+        new_ubcoef = pos[:, np.newaxis] * deeppoly.ubcoef + neg[:, np.newaxis] * deeppoly.lbcoef
+        new_lbcoef = pos[:, np.newaxis] * deeppoly.lbcoef + neg[:, np.newaxis] * deeppoly.ubcoef
+        new_ubconst = pos * deeppoly.ubconst + neg * deeppoly.lbconst + self.shift
+        new_lbconst = pos * deeppoly.lbconst + neg * deeppoly.ubconst + self.shift
+        deeppoly.ubcoef = new_ubcoef
+        deeppoly.lbcoef = new_lbcoef
+        deeppoly.ubconst = new_ubconst
+        deeppoly.lbconst = new_lbconst
+        deeppoly.ubs = (np.maximum(deeppoly.ubcoef, 0) @ deeppoly.inputbounds[:, 1]
+                       + np.minimum(deeppoly.ubcoef, 0) @ deeppoly.inputbounds[:, 0]
+                       + deeppoly.ubconst)
+        deeppoly.lbs = (np.maximum(deeppoly.lbcoef, 0) @ deeppoly.inputbounds[:, 0]
+                       + np.minimum(deeppoly.lbcoef, 0) @ deeppoly.inputbounds[:, 1]
+                       + deeppoly.lbconst)
+
+    def execute(self, state):
+        scale_shaped = self.scale.reshape(self.input_shape)
+        shift_shaped = self.shift.reshape(self.input_shape)
+        return state * scale_shaped + shift_shaped
+
 class MatMulLayer(Freezable):
     'onnx matmul layer'
 
@@ -818,7 +874,7 @@ class Convolutional2dLayer(Freezable):
     outputs multi-channel 2d data
     '''
 
-    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='same', boundary='fill', strides=(1, 1), pads=None):
+    def __init__(self, layer_num, kernels, biases, prev_layer_output_shape, mode='same', boundary='fill', strides=(1, 1), pads=None, is_transpose=False):
         self.layer_num = layer_num
         self.biases = biases
         self.mode = mode
@@ -827,6 +883,7 @@ class Convolutional2dLayer(Freezable):
         # Store explicit padding values for ONNX compatibility
         # pads format: [top, left, bottom, right] or None for auto-padding based on mode
         self.pads = pads
+        self.is_transpose = is_transpose
 
         assert isinstance(prev_layer_output_shape, tuple), f"prev_layer_shape was {prev_layer_output_shape}"
 
@@ -843,6 +900,11 @@ class Convolutional2dLayer(Freezable):
         assert len(kernels.shape) == 4, "expected shape is 4: (# output channels, # input channels, x, y); " + \
                                 f"got: {kernels.shape}"
 
+        # ONNX ConvTranspose weight layout is [C_in, C_out, kH, kW]; swap to [C_out, C_in, kH, kW]
+        # so the rest of the init (and execute) can treat it identically to regular Conv.
+        if is_transpose:
+            kernels = kernels.swapaxes(0, 1)
+
         # for now, all kernels have same width and height so this is a good sanity check for input correctness
         assert kernels[0][0].shape[0] == kernels[0][0].shape[1], \
             f"kernel w and h are not the same: {kernels[0][0].shape}"
@@ -854,12 +916,41 @@ class Convolutional2dLayer(Freezable):
         for k in kernels:
             flipped_channel_kernel = []
             self.kernels.append(flipped_channel_kernel)
-            
+
             for channel_kernel in k:
                 assert len(channel_kernel.shape) == 2, "expected a list of list of 2d kernels"
-                # flip each kernel since convolution2d works in reverse order
-                flipped_channel_kernel.append(np.flipud(np.fliplr(channel_kernel)))
-        
+                if is_transpose:
+                    # ConvTranspose uses raw kernel with convolve2d (no pre-flip needed)
+                    flipped_channel_kernel.append(channel_kernel.copy())
+                else:
+                    # flip each kernel since convolution2d works in reverse order
+                    flipped_channel_kernel.append(np.flipud(np.fliplr(channel_kernel)))
+
+        # Build (C_out, C_in, kH, kW) array for vectorized execute paths.
+        # Always stores the UNFLIPPED (correlation-style) kernels:
+        #   - Regular Conv:    self.kernels stores flipud(fliplr(weight)), so we flip back
+        #   - ConvTranspose:   self.kernels stores weight as-is (no flip), keep as-is
+        # This lets im2col (dot-product = correlation) use kernels_array directly.
+        # fftconvolve (mathematical convolution) also uses these unflipped kernels correctly
+        # because fftconvolve(x, w) = correlate(x, flip(w)) = convolve(x, w) in the
+        # standard mathematical sense, which is what ConvTranspose requires.
+        C_out_n = len(self.kernels)
+        C_in_n = len(self.kernels[0])
+        kH_n = self.kernels[0][0].shape[0]
+        kW_n = self.kernels[0][0].shape[1]
+        if is_transpose:
+            # ConvTranspose: self.kernels already stores unflipped weights
+            self.kernels_array = np.array(
+                [[self.kernels[co][ci] for ci in range(C_in_n)] for co in range(C_out_n)],
+                dtype=np.float32
+            ).reshape(C_out_n, C_in_n, kH_n, kW_n)
+        else:
+            # Regular Conv: self.kernels stores flip(weight), flip back to get original weights
+            self.kernels_array = np.array(
+                [[np.flipud(np.fliplr(self.kernels[co][ci])) for ci in range(C_in_n)] for co in range(C_out_n)],
+                dtype=np.float32
+            ).reshape(C_out_n, C_in_n, kH_n, kW_n)
+
         self.freeze_attrs()
 
     def __str__(self):
@@ -876,26 +967,34 @@ class Convolutional2dLayer(Freezable):
         # prev_layer_output_shape: <height, width, depth>
 
         depth = len(self.kernels)
-        height = self.prev_layer_output_shape[0]
-        width = self.prev_layer_output_shape[1]
+        h_in = self.prev_layer_output_shape[0]
+        w_in = self.prev_layer_output_shape[1]
         kernel_h = self.kernels[0][0].shape[0]
         kernel_w = self.kernels[0][0].shape[1]
 
-        if self.pads is not None:
+        if self.is_transpose:
+            # ConvTranspose output formula: (H_in - 1)*s - 2*p + k
+            ph = pw = 0
+            if self.pads is not None:
+                top, left, bottom, right = self.pads
+                ph, pw = top + bottom, left + right
+            height = (h_in - 1) * self.strides[0] - ph + kernel_h
+            width  = (w_in - 1) * self.strides[1] - pw + kernel_w
+        elif self.pads is not None:
             # ONNX explicit padding: pads = [top, left, bottom, right]
             top, left, bottom, right = self.pads
             # Add padding to input size
-            padded_height = height + top + bottom
-            padded_width = width + left + right
+            padded_height = h_in + top + bottom
+            padded_width = w_in + left + right
             # Calculate output size with 'valid' convolution on padded input
             height = (padded_height - kernel_h) // self.strides[0] + 1
             width = (padded_width - kernel_w) // self.strides[1] + 1
         elif self.mode == 'valid':
-            height = (height - kernel_h) // self.strides[0] + 1
-            width = (width - kernel_w) // self.strides[1] + 1
+            height = (h_in - kernel_h) // self.strides[0] + 1
+            width = (w_in - kernel_w) // self.strides[1] + 1
         else:  # mode == 'same'
-            height = (height + self.strides[0] - 1) // self.strides[0]
-            width = (width + self.strides[1] - 1) // self.strides[1]
+            height = (h_in + self.strides[0] - 1) // self.strides[0]
+            width = (w_in + self.strides[1] - 1) // self.strides[1]
 
         return (height, width, depth)
 
@@ -961,6 +1060,103 @@ class Convolutional2dLayer(Freezable):
             out_max_x = min(output_shape[1] - 1, max_x // stride_x)
 
         return (out_min_y, out_max_y, out_min_x, out_max_x)
+
+    def _apply_conv_to_mat(self, mat, shape):
+        """Apply the conv/ConvTranspose transformation to all generator columns at once.
+
+        mat: (in_size, G) float array — G generator columns stacked horizontally.
+        shape: (H, W, C_in) input shape — must equal self.prev_layer_output_shape.
+        Returns: (out_size, G) float array.
+
+        For regular Conv: batched im2col + single BLAS matmul for all G generators.
+        For ConvTranspose: batched upsample + im2col on upsampled grid + matmul.
+          ConvTranspose(x) = FullConv(upsample(x), W) which, after zero-insertion, is
+          equivalent to a regular (no-stride) convolution on the upsampled grid.
+          We upsample all G generators at once, then apply batched im2col + matmul.
+        """
+        K = self.kernels_array  # (C_out, C_in, kH, kW)
+        C_out, C_in, kH, kW = K.shape
+        sh, sw = self.strides
+        H, W, _ = shape
+        G = mat.shape[1]
+
+        # Reshape all G generator columns to (G, H, W, C_in)
+        X = mat.T.reshape(G, H, W, C_in).astype(np.float32, copy=False)
+
+        if self.is_transpose:
+            # Upsample all G generators at once: (G, H2, W2, C_in)
+            H2 = (H - 1) * sh + 1
+            W2 = (W - 1) * sw + 1
+            X_up = np.zeros((G, H2, W2, C_in), dtype=np.float32)
+            X_up[:, ::sh, ::sw, :] = X
+
+            # Apply im2col in 'full' mode (no stride on output, pad with kH-1, kW-1)
+            ph, pw = kH - 1, kW - 1
+            X_p = np.pad(X_up, ((0, 0), (ph, ph), (pw, pw), (0, 0)), mode='constant')
+            Gp, Hp, Wp, _ = X_p.shape
+            out_H = Hp - kH + 1
+            out_W = Wp - kW + 1
+
+            if self.pads is not None:
+                top, left, bottom, right = self.pads
+                # Apply explicit padding crop (output_padding for ConvTranspose)
+                out_H -= (top + bottom)
+                out_W -= (left + right)
+        else:
+            # Regular Conv: apply explicit or mode-based padding
+            if self.pads is not None:
+                top, left, bottom, right = self.pads
+                X_p = np.pad(X, ((0, 0), (top, bottom), (left, right), (0, 0)), mode='constant')
+            elif self.mode == 'same':
+                pad_h = max(kH - 1, 0)
+                pad_w = max(kW - 1, 0)
+                X_p = np.pad(X, ((0, 0), (pad_h//2, pad_h - pad_h//2),
+                                 (pad_w//2, pad_w - pad_w//2), (0, 0)), mode='constant')
+            else:
+                X_p = X  # valid, no padding
+
+            Gp, Hp, Wp, _ = X_p.shape
+            out_H = (Hp - kH) // sh + 1
+            out_W = (Wp - kW) // sw + 1
+
+        # im2col computes correlation (dot product).  For regular Conv, kernels_array stores
+        # the unflipped (original) weights and correlation = what we want.
+        # For ConvTranspose, execute() uses fftconvolve (mathematical convolution), which
+        # requires flipping the kernel.  Match that by flipping kernels_array here too.
+        if self.is_transpose:
+            K_use = K[:, :, ::-1, ::-1]  # flip spatial dims: correlation of flipped = convolution
+        else:
+            K_use = K
+        K_r = K_use.transpose(0, 2, 3, 1).reshape(C_out, kH * kW * C_in)
+
+        # Chunk generators to keep im2col buffer under ~128MB.
+        # Process all generators at once (no chunking); memory is ~G * out_H * out_W * kH * kW * C_in * 4 bytes
+        chunk = G
+
+        out_stride_h = 1 if self.is_transpose else sh
+        out_stride_w = 1 if self.is_transpose else sw
+
+        result_parts = []
+        for g_start in range(0, G, chunk):
+            g_end = min(g_start + chunk, G)
+            Gc = g_end - g_start
+            X_chunk = X_p[g_start:g_end]  # (Gc, Hp, Wp, C_in)
+
+            col_chunk = np.lib.stride_tricks.as_strided(
+                X_chunk,
+                shape=(Gc, out_H, out_W, kH, kW, C_in),
+                strides=(X_chunk.strides[0],
+                         X_chunk.strides[1] * out_stride_h,
+                         X_chunk.strides[2] * out_stride_w,
+                         X_chunk.strides[1], X_chunk.strides[2], X_chunk.strides[3])
+            ).reshape(Gc * out_H * out_W, kH * kW * C_in)
+
+            out_chunk = (col_chunk @ K_r.T).reshape(Gc, out_H, out_W, C_out)
+            result_parts.append(out_chunk.reshape(Gc, -1))
+
+        result = np.concatenate(result_parts, axis=0) if len(result_parts) > 1 else result_parts[0]
+
+        return result.T  # (out_size, G)
 
     def _batch_generators_for_conv(self, mat, shape):
         """
@@ -1076,6 +1272,8 @@ class Convolutional2dLayer(Freezable):
 
         if not Settings.CONV_BATCHING_ENABLED:
             should_batch = False
+        elif self.is_transpose:
+            should_batch = False  # _compute_output_region uses Conv geometry; skip for ConvTranspose
         elif Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
             should_batch = False
         elif star.a_mat.shape[1] > 0:
@@ -1086,17 +1284,10 @@ class Convolutional2dLayer(Freezable):
                 should_batch = False
 
         if not should_batch:
-            # Use original unoptimized path
+            # Vectorized path: apply conv to all generator columns simultaneously
             Timers.tic('transform_star_unbatched')
-            result_columns = []
-            for cindex in range(star.a_mat.shape[1]):
-                column = star.a_mat[:, cindex]
-                multichannel_state = nn_unflatten(column, shape)
-                multichannel_state = self.execute(multichannel_state, zero_bias=True)
-                flat = nn_flatten(multichannel_state)
-                flat.shape = (flat.size, 1)
-                result_columns.append(flat)
-            star.a_mat = np.hstack(result_columns)
+            if star.a_mat.shape[1] > 0:
+                star.a_mat = self._apply_conv_to_mat(star.a_mat, shape)
 
             # bias transformation
             multichannel_state = nn_unflatten(star.bias, shape)
@@ -1190,6 +1381,8 @@ class Convolutional2dLayer(Freezable):
 
         if not Settings.CONV_BATCHING_ENABLED:
             should_batch = False
+        elif self.is_transpose:
+            should_batch = False  # _compute_output_region uses Conv geometry; skip for ConvTranspose
         elif Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
             should_batch = False
         elif zono.mat_t.shape[1] > 0:
@@ -1200,17 +1393,10 @@ class Convolutional2dLayer(Freezable):
                 should_batch = False
 
         if not should_batch:
-            # Use original unoptimized path
+            # Vectorized path: apply conv to all generator columns simultaneously
             Timers.tic('transform_zono_unbatched')
-            result_columns = []
-            for cindex in range(zono.mat_t.shape[1]):
-                column = zono.mat_t[:, cindex]
-                multichannel_state = nn_unflatten(column, shape)
-                multichannel_state = self.execute(multichannel_state, zero_bias=True)
-                flat = nn_flatten(multichannel_state)
-                flat.shape = (flat.size, 1)
-                result_columns.append(flat)
-            zono.mat_t = np.hstack(result_columns)
+            if zono.mat_t.shape[1] > 0:
+                zono.mat_t = self._apply_conv_to_mat(zono.mat_t, shape)
 
             # center transformation
             multichannel_state = nn_unflatten(zono.center, shape)
@@ -1305,50 +1491,61 @@ class Convolutional2dLayer(Freezable):
         assert state.shape == self.prev_layer_output_shape, f"expected shape {self.prev_layer_output_shape}, " + \
                                                             f"got {state.shape}"
 
-        # Handle explicit padding (ONNX pads) vs auto-padding (scipy mode)
-        if self.pads is not None:
-            # ONNX explicit padding: pads = [top, left, bottom, right]
-            # Pad the input state first
-            top, left, bottom, right = self.pads
-            # state shape: (height, width, channels)
-            # Pad only spatial dimensions (height, width), not channels
-            state_padded = np.pad(state, ((top, bottom), (left, right), (0, 0)), mode='constant', constant_values=0)
-            conv_mode = 'valid'  # Use valid mode after explicit padding
+        K = self.kernels_array  # (C_out, C_in, kH, kW)
+        C_out, C_in, kH, kW = K.shape
+        sh, sw = self.strides
+        state_f = state.astype(np.float32, copy=False)
+
+        if self.is_transpose:
+            # ConvTranspose: upsample input then apply full-mode convolution.
+            # Vectorized: batch all (C_out * C_in) spatial convolutions via fftconvolve.
+            H, W, _ = state_f.shape
+            H2 = (H - 1) * sh + 1
+            W2 = (W - 1) * sw + 1
+            # Upsample all input channels at once: (C_in, H2, W2)
+            x_up = np.zeros((C_in, H2, W2), dtype=np.float32)
+            x_up[:, ::sh, ::sw] = state_f.transpose(2, 0, 1)
+            out_H = H2 + kH - 1
+            out_W = W2 + kW - 1
+            # Flatten to (C_out*C_in, H2, W2) and (C_out*C_in, kH, kW) for one fftconvolve call
+            x_flat = np.broadcast_to(x_up[np.newaxis], (C_out, C_in, H2, W2)).reshape(C_out * C_in, H2, W2).copy()
+            k_flat = K.reshape(C_out * C_in, kH, kW)
+            convolved = fftconvolve(x_flat, k_flat, mode='full', axes=(1, 2))  # (C_out*C_in, out_H, out_W)
+            # Sum over C_in dimension → (C_out, out_H, out_W), then to HWC
+            output = convolved.reshape(C_out, C_in, out_H, out_W).sum(axis=1)  # (C_out, out_H, out_W)
         else:
-            # Use scipy's auto-padding based on mode
-            state_padded = state
-            conv_mode = self.mode
+            # Standard Conv: build padded input then im2col + matmul.
+            if self.pads is not None:
+                top, left, bottom, right = self.pads
+                state_p = np.pad(state_f, ((top, bottom), (left, right), (0, 0)), mode='constant')
+            elif self.mode == 'same':
+                # Compute symmetric padding to match scipy 'same' behaviour
+                pad_h = max(kH - 1, 0)
+                pad_w = max(kW - 1, 0)
+                state_p = np.pad(state_f, ((pad_h // 2, pad_h - pad_h // 2),
+                                           (pad_w // 2, pad_w - pad_w // 2), (0, 0)), mode='constant')
+            else:
+                state_p = state_f  # mode='valid', no padding
 
-        output = []
-        output_shape = self.get_output_shape()
+            Hp, Wp, _ = state_p.shape
+            out_H = (Hp - kH) // sh + 1
+            out_W = (Wp - kW) // sw + 1
 
-        for kernel, bias in zip(self.kernels, self.biases):
-            out = np.empty(output_shape[:-1])
+            # im2col: extract (out_H, out_W, kH, kW, C_in) patches then reshape to (out_H*out_W, kH*kW*C_in)
+            col = np.lib.stride_tricks.as_strided(
+                state_p,
+                shape=(out_H, out_W, kH, kW, C_in),
+                strides=(state_p.strides[0] * sh, state_p.strides[1] * sw,
+                         state_p.strides[0], state_p.strides[1], state_p.strides[2])
+            ).reshape(out_H * out_W, kH * kW * C_in)
+            # K: (C_out, C_in, kH, kW) → (C_out, kH, kW, C_in) → (C_out, kH*kW*C_in)
+            K_r = K.transpose(0, 2, 3, 1).reshape(C_out, kH * kW * C_in)
+            # matmul → (out_H*out_W, C_out) → (C_out, out_H, out_W)
+            output = (col @ K_r.T).reshape(out_H, out_W, C_out).transpose(2, 0, 1)
 
-            bias = bias if not zero_bias else 0
-
-            out.fill(bias)
-            output.append(out)
-
-            for i, channel_kernel in enumerate(kernel):
-                # depth is last channel (bad for convolution performance I think)
-                state2d = state_padded[:, :, i]
-                Timers.tic('convolve2d')
-                channel_out = convolve2d(state2d, channel_kernel, mode=conv_mode, boundary=self.boundary)
-                Timers.toc('convolve2d')
-
-                Timers.tic('add')
-                # Apply stride by subsampling
-                if self.strides != (1, 1):
-                    channel_out = channel_out[::self.strides[0], ::self.strides[1]]
-                out += channel_out
-                Timers.toc('add')
-
-        Timers.tic('output transpose')
-        output = np.array(output, dtype=float)
-        # convert to y, x, z
-        output = output.transpose((1, 2, 0))
-        Timers.toc('output transpose')
+        # Add bias (or zero for zero_bias=True) and convert to HWC
+        bias_vec = np.zeros(C_out, dtype=np.float32) if zero_bias else self.biases.astype(np.float32)
+        output = output.transpose(1, 2, 0) + bias_vec  # (out_H, out_W, C_out)
 
         Timers.toc('execute Convolutional2dLayer')
 
