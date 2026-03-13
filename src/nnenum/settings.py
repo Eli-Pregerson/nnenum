@@ -60,9 +60,58 @@ class Settings(metaclass=FreezableMeta):
 
         cls.LOG_CONV_BATCHING = False # log convolution batching statistics
 
-        cls.CONV_BATCHING_ENABLED = False # set to False to disable conv generator batching entirely
+        cls.CONV_BATCHING_ENABLED = True # set to False to disable conv generator batching entirely
         cls.CONV_BATCHING_MIN_SPARSITY = 0.05 # skip batching if generator sparsity > 5% (too dense)
         cls.CONV_BATCHING_FIRST_LAYER_ONLY = False # only apply batching to first conv layer
+
+        # Batching strategy when CONV_METHOD='batching':
+        #   'greedy'  - original O(n*B) scan: assign each gen to first compatible batch
+        #   'random'  - O(n*k) randomized: try k random batches before creating a new one
+        #   'period'  - O(n) grid-period: assign by (y%period, x%period) — zero conflict checking
+        cls.CONV_BATCHING_STRATEGY = 'greedy'
+
+        # Max consecutive failures before creating a new batch (only for 'random' strategy)
+        cls.CONV_BATCHING_MAX_FAILURES = 10
+
+        # Conv transformation method for abstract domain (star/zono) generator columns.
+        # 'dense':    vectorized im2col matmul on all generators at once (default)
+        # 'sparse':   prebuilt Toeplitz sparse matrix W; scipy sparse @ gen_mat
+        # 'batching': greedy spatial grouping + im2col batched matmul (legacy; now slower than
+        #             dense because the grouping overhead exceeds any FLOP savings)
+        # Note: CONV_BATCHING_MIN_SPARSITY threshold is applied for 'batching' and 'sparse';
+        # both fall back to 'dense' when generators are too dense to benefit.
+        cls.CONV_METHOD = 'sparse'
+
+        # Maximum memory (GB) allowed for a dense mat_t materialization.
+        # If .toarray() on a sparse mat_t would exceed this, take the sparse path instead.
+        cls.MEMORY_BUDGET_GB = 8.0
+
+        # Print per-layer sparse stats (density, nnz, timing) for debugging the sparse path.
+        cls.SPARSE_DEBUG = False
+
+        # Minimum number of generators required to use the sparse conv path.
+        # _build_conv_matrix has a large one-time cost (e.g. ~21s for VGGNet layer 0).
+        # With few generators, dense im2col is faster because the build cost doesn't amortize.
+        # For VGGNet layer 0: dense ~0.002s/gen, build ~21.5s → breakeven ~10750 generators.
+        # Default 5000 is conservative (sparse wins clearly above this).
+        cls.CONV_SPARSE_MIN_GENERATORS = 5000
+
+        # Allow star.a_mat to remain as a scipy sparse CSR matrix through conv layers.
+        # Densification is deferred to FC/MatMul layers where W @ a_mat produces a dense result anyway.
+        # Disable for small networks (no benefit, avoids any sparse overhead).
+        cls.SPARSE_STAR = False
+
+        # Run interval bound propagation (IBP) as a fast precheck before star enumeration.
+        # IBP propagates just two vectors (lb, ub) through the network — O(neurons) memory.
+        # If IBP proves the property, return immediately without constructing the star/zono.
+        # Very effective when epsilon is tiny. Off by default; enable per benchmark profile.
+        cls.TRY_IBP = False
+
+        # When SPARSE_STAR=True and a conv layer would produce a star.a_mat exceeding
+        # MEMORY_BUDGET_GB, collapse the star to a per-neuron interval (diagonal) star
+        # and continue propagation. Overapproximation — sound for unsat, may miss sat.
+        # If TRY_IBP is also True, attempts IBP from the interval bounds first.
+        cls.SPARSE_INTERVAL_FALLBACK = False
 
         cls.CHECK_SINGLE_THREAD_BLAS = False
         # idea... replace this with threadpoolctl: https://github.com/joblib/threadpoolctl

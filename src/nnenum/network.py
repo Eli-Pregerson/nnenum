@@ -372,7 +372,11 @@ class FlattenLayer(Freezable):
             perm = _hwc_to_chw_permutation(h, w, c)
             star.bias = star.bias[perm]
             if star.a_mat is not None:
-                star.a_mat = star.a_mat[perm, :]
+                from scipy.sparse import issparse
+                if issparse(star.a_mat):
+                    star.a_mat = star.a_mat.tocsr()[perm, :]
+                else:
+                    star.a_mat = star.a_mat[perm, :]
 
     def transform_zono(self, zono):
         'transform the zono for this layer'
@@ -471,7 +475,11 @@ class ReshapeLayer(Freezable):
             perm = _hwc_to_chw_permutation(h, w, c)
             star.bias = star.bias[perm]
             if star.a_mat is not None:
-                star.a_mat = star.a_mat[perm, :]
+                from scipy.sparse import issparse
+                if issparse(star.a_mat):
+                    star.a_mat = star.a_mat.tocsr()[perm, :]
+                else:
+                    star.a_mat = star.a_mat[perm, :]
         # For other cases (flat→flat, flat→3D), no row permutation needed.
 
     def transform_zono(self, zono):
@@ -677,7 +685,9 @@ class MatMulLayer(Freezable):
     def transform_star(self, star):
         'apply on star'
 
-        star.a_mat = np.dot(self.mat, star.a_mat)
+        from scipy.sparse import issparse
+        # Use @ directly when sparse — dense @ sparse → dense without materializing sparse
+        star.a_mat = self.mat @ star.a_mat
         star.bias = np.dot(self.mat, star.bias)
 
     def transform_zono(self, zono):
@@ -798,7 +808,8 @@ class FullyConnectedLayer(Freezable):
         if star.a_mat is None:
             star.a_mat = self.weights.copy()
         else:
-            star.a_mat = np.dot(self.weights, star.a_mat)
+            # Use @ directly — dense @ sparse → dense without materializing sparse input
+            star.a_mat = self.weights @ star.a_mat
 
         if star.bias is None:
             star.bias = self.biases.copy()
@@ -950,6 +961,9 @@ class Convolutional2dLayer(Freezable):
                 [[np.flipud(np.fliplr(self.kernels[co][ci])) for ci in range(C_in_n)] for co in range(C_out_n)],
                 dtype=np.float32
             ).reshape(C_out_n, C_in_n, kH_n, kW_n)
+
+        # Sparse conv matrix (built lazily on first use when CONV_METHOD='sparse')
+        self.conv_matrix = None
 
         self.freeze_attrs()
 
@@ -1158,6 +1172,150 @@ class Convolutional2dLayer(Freezable):
 
         return result.T  # (out_size, G)
 
+    def _build_conv_matrix(self):
+        """Build and return the sparse Toeplitz matrix W of shape (out_size, in_size).
+
+        W encodes the convolution as a linear map: out_vec = W @ in_vec, where
+        in_vec and out_vec are HWC-flat vectors.  Each row of W corresponds to one
+        output element (h_out, w_out, c_out) and has nonzeros at the kH*kW*C_in
+        input positions in its receptive field, with values equal to the kernel weights.
+
+        The matrix is built once and cached in self.conv_matrix for reuse across
+        all generator columns and all verification calls on this network.
+
+        Only supported for regular Conv (not ConvTranspose).
+        """
+        from scipy.sparse import csr_matrix
+
+        K = self.kernels_array          # (C_out, C_in, kH, kW) unflipped weights
+        C_out, C_in, kH, kW = K.shape
+        sh, sw = self.strides
+        H_in, W_in, _ = self.prev_layer_output_shape
+
+        # Compute padded input dimensions and output dimensions (same logic as _apply_conv_to_mat)
+        if self.pads is not None:
+            top, left, bottom, right = self.pads
+            H_p = H_in + top + bottom
+            W_p = W_in + left + right
+            pad_top, pad_left = top, left
+        elif self.mode == 'same':
+            pad_h = max(kH - 1, 0)
+            pad_w = max(kW - 1, 0)
+            pad_top  = pad_h // 2
+            pad_left = pad_w // 2
+            H_p = H_in + pad_h
+            W_p = W_in + pad_w
+        else:  # 'valid'
+            pad_top, pad_left = 0, 0
+            H_p, W_p = H_in, W_in
+
+        out_H = (H_p - kH) // sh + 1
+        out_W = (W_p - kW) // sw + 1
+
+        in_size  = H_in * W_in * C_in
+        out_size = out_H * out_W * C_out
+
+        # Build COO arrays
+        nnz = out_H * out_W * C_out * kH * kW * C_in
+        row_idx = np.empty(nnz, dtype=np.int32)
+        col_idx = np.empty(nnz, dtype=np.int32)
+        data    = np.empty(nnz, dtype=np.float32)
+
+        idx = 0
+        for h_out in range(out_H):
+            for w_out in range(out_W):
+                h_base = h_out * sh - pad_top   # top-left corner in padded input (unpadded coords)
+                w_base = w_out * sw - pad_left
+                for c_out in range(C_out):
+                    row = (h_out * out_W + w_out) * C_out + c_out  # HWC-flat output index
+                    for kh in range(kH):
+                        h_in = h_base + kh
+                        if h_in < 0 or h_in >= H_in:
+                            continue
+                        for kw in range(kW):
+                            w_in = w_base + kw
+                            if w_in < 0 or w_in >= W_in:
+                                continue
+                            for c_in in range(C_in):
+                                col = (h_in * W_in + w_in) * C_in + c_in  # HWC-flat input index
+                                row_idx[idx] = row
+                                col_idx[idx] = col
+                                data[idx]    = K[c_out, c_in, kh, kw]
+                                idx += 1
+
+        # Trim (padding zeros skipped above reduce actual nnz)
+        row_idx = row_idx[:idx]
+        col_idx = col_idx[:idx]
+        data    = data[:idx]
+
+        return csr_matrix((data, (row_idx, col_idx)), shape=(out_size, in_size), dtype=np.float32)
+
+    def _apply_conv_to_mat_sparse(self, mat, shape):
+        """Sparse matrix implementation of conv transformation.
+
+        Converts the (in_size, G) generator matrix to CSC sparse format, multiplies
+        by the prebuilt Toeplitz W_sparse (CSR).  Returns a CSC sparse matrix so the
+        caller can propagate sparsity through subsequent layers.
+
+        mat: (in_size, G) dense or CSC sparse float array
+        shape: (H, W, C_in) — must equal self.prev_layer_output_shape
+        Returns: (out_size, G) CSC sparse float32 matrix
+        """
+        from scipy.sparse import csc_matrix, issparse
+
+        if self.conv_matrix is None:
+            self.conv_matrix = self._build_conv_matrix()
+
+        if not issparse(mat):
+            gen_sparse = csc_matrix(mat.astype(np.float32, copy=False))
+        else:
+            gen_sparse = mat.tocsc()
+
+        result = self.conv_matrix @ gen_sparse   # CSR @ CSC → sparse result
+        result = result.tocsc()
+        result.eliminate_zeros()
+        return result  # (out_size, G) CSC sparse
+
+    def _would_exceed_memory(self, star):
+        '''True if propagating star.a_mat through this conv layer would exceed MEMORY_BUDGET_GB.
+
+        Estimates output nnz as: input_nnz * (kernel_h * kernel_w) since each input nonzero
+        fans out to at most kernel_size² output positions (for stride-1, same-pad conv).
+
+        Also fires if the current a_mat is already large enough that holding it while running
+        overapprox (which deep-copies it) would exceed half the budget — so the collapse
+        happens before the overapprox zono is created from a huge matrix.
+        '''
+        from nnenum.settings import Settings
+        from scipy.sparse import issparse
+        if not issparse(star.a_mat):
+            return False
+
+        # Check if the *current* a_mat is already too large for overapprox deep copy
+        # (overapprox deep-copies the prefilter zono which points to star.a_mat)
+        current_bytes = star.a_mat.nnz * 8  # CSR: data + col_indices
+        if current_bytes > Settings.MEMORY_BUDGET_GB * 1e9 / 2:
+            return True
+
+        # Check if the conv_matrix (Toeplitz) for this layer would exceed budget.
+        # conv_matrix nnz ≈ out_size × kH × kW × C_in.
+        kh, kw = self.kernels[0][0].shape[:2]
+        c_in = len(self.kernels[0])  # number of input channels
+        out_size = int(np.prod(self.get_output_shape()))
+        conv_matrix_nnz = out_size * kh * kw * c_in
+        conv_matrix_bytes = conv_matrix_nnz * 4  # float32
+        if conv_matrix_bytes > Settings.MEMORY_BUDGET_GB * 1e9 / 2:
+            return True
+
+        # Check if *output* of this conv would exceed budget
+        input_nnz = star.a_mat.nnz
+        estimated_output_nnz = input_nnz * kh * kw
+        estimated_bytes = estimated_output_nnz * 8
+        dense_bytes = out_size * star.a_mat.shape[1] * 4
+        projected_bytes = min(estimated_bytes, dense_bytes)
+
+        return projected_bytes > Settings.MEMORY_BUDGET_GB * 1e9 / 2
+
     def _batch_generators_for_conv(self, mat, shape):
         """
         Group generator columns that won't interact during convolution into batches.
@@ -1174,6 +1332,8 @@ class Convolutional2dLayer(Freezable):
             }
         """
         Timers.tic('batch_generators_for_conv')
+
+        from nnenum.settings import Settings
 
         height, width, channels = shape
         kernel_size = self.kernels[0][0].shape[0]  # Assume square kernels
@@ -1205,51 +1365,126 @@ class Convolutional2dLayer(Freezable):
                 'column': column
             })
 
-        # Greedy batching: assign each generator to first compatible batch
-        batches = []
-
         def output_regions_overlap(region1, region2):
-            """Check if two output regions overlap"""
             if region1 is None or region2 is None:
                 return False
-
             min_y1, max_y1, min_x1, max_x1 = region1
             min_y2, max_y2, min_x2, max_x2 = region2
+            return not (max_y1 < min_y2 or max_y2 < min_y1 or max_x1 < min_x2 or max_x2 < min_x1)
 
-            y_overlap = not (max_y1 < min_y2 or max_y2 < min_y1)
-            x_overlap = not (max_x1 < min_x2 or max_x2 < min_x1)
+        def make_batch(gen_info):
+            return {
+                'indices': [gen_info['index']],
+                'input_regions': [gen_info['input_region']],
+                'output_regions': [gen_info['output_region']]
+            }
 
-            return y_overlap and x_overlap
+        def add_to_batch(batch, gen_info):
+            batch['indices'].append(gen_info['index'])
+            batch['input_regions'].append(gen_info['input_region'])
+            batch['output_regions'].append(gen_info['output_region'])
 
-        for gen_info in generator_info:
-            # Try to add to existing batch
-            placed = False
-            for batch in batches:
-                # Check if this generator's output region conflicts with any generator in the batch
-                conflicts = False
-                for out_region in batch['output_regions']:
-                    if output_regions_overlap(gen_info['output_region'], out_region):
-                        conflicts = True
+        strategy = Settings.CONV_BATCHING_STRATEGY
+
+        if strategy == 'greedy':
+            # O(n*B): scan all existing batches in order, place into first compatible one
+            batches = []
+            for gen_info in generator_info:
+                placed = False
+                for batch in batches:
+                    if not any(output_regions_overlap(gen_info['output_region'], r)
+                               for r in batch['output_regions']):
+                        add_to_batch(batch, gen_info)
+                        placed = True
                         break
+                if not placed:
+                    batches.append(make_batch(gen_info))
 
-                if not conflicts:
-                    # Add to this batch
-                    batch['indices'].append(gen_info['index'])
-                    batch['input_regions'].append(gen_info['input_region'])
-                    batch['output_regions'].append(gen_info['output_region'])
-                    placed = True
-                    break
+        elif strategy == 'random':
+            # O(n*k): try up to MAX_FAILURES random batches before creating a new one.
+            # Randomizing which batch we try avoids the greedy bias of always filling the
+            # first batch, leading to better average fill rates.
+            import random
+            max_failures = Settings.CONV_BATCHING_MAX_FAILURES
+            batches = []
+            for gen_info in generator_info:
+                placed = False
+                if batches:
+                    # Sample a random permutation of existing batch indices
+                    order = list(range(len(batches)))
+                    random.shuffle(order)
+                    failures = 0
+                    for bi in order:
+                        if failures >= max_failures:
+                            break
+                        batch = batches[bi]
+                        if not any(output_regions_overlap(gen_info['output_region'], r)
+                                   for r in batch['output_regions']):
+                            add_to_batch(batch, gen_info)
+                            placed = True
+                            break
+                        failures += 1
+                if not placed:
+                    batches.append(make_batch(gen_info))
 
-            if not placed:
-                # Create new batch
-                batches.append({
-                    'indices': [gen_info['index']],
-                    'input_regions': [gen_info['input_region']],
-                    'output_regions': [gen_info['output_region']]
-                })
+        else:
+            assert strategy == 'period', f"Unknown batching strategy: {strategy!r}"
+            # O(n): assign generators to batches by (y % period, x % period).
+            # Generators in the same period-cell have non-overlapping output regions
+            # by construction (period = output region size in each spatial dimension).
+            # This requires generators to be 1-hot in spatial position (the typical
+            # initial-star case). Falls back to greedy for non-1-hot generators.
+            #
+            # Output region size per generator = kernel_size (for same/pad convolutions).
+            # To guarantee non-overlap we need period >= output_region_width.
+            # For a kxk kernel with same padding, each 1-hot input at (y,x) produces
+            # output nonzeros in a region of width k (centered on (y,x)).
+            # Period = k ensures generators (y1,x1) and (y2,x2) with the same
+            # (y%k, x%k) are separated by at least k in y or x, so their output
+            # regions don't overlap.
+            kernel_size = self.kernels[0][0].shape[0]
+            period = kernel_size  # minimum safe period for same-padded conv
+            batch_map = {}  # (y%k, x%k, slot) -> batch index
+            pixel_slot_counts = {}  # (y, x) -> count of gens assigned so far
+            batches = []
+            for gen_info in generator_info:
+                region = gen_info['input_region']
+                if region is None:
+                    batches.append(make_batch(gen_info))
+                    continue
+                min_y, max_y, min_x, max_x = region
+                # Only use period assignment for single-pixel (1-hot) generators.
+                # Multi-pixel generators could span multiple period cells.
+                if max_y == min_y and max_x == min_x:
+                    # Generators with the same (y%period, x%period) are separated by >=period
+                    # pixels in y or x, so their output regions don't overlap.
+                    # However, multiple generators at the exact same (y, x) pixel (different
+                    # channels) share an identical output region and cannot be batched together.
+                    # Use a per-pixel counter to assign them to successive period-cell slots.
+                    pixel_key = (min_y, min_x)
+                    slot = pixel_slot_counts.get(pixel_key, 0)
+                    pixel_slot_counts[pixel_key] = slot + 1
+                    # The batch key is (y%period, x%period, slot) so same-pixel generators
+                    # land in different slots while same-slot different-pixel generators batch.
+                    key = (min_y % period, min_x % period, slot)
+                    if key in batch_map:
+                        add_to_batch(batches[batch_map[key]], gen_info)
+                    else:
+                        batch_map[key] = len(batches)
+                        batches.append(make_batch(gen_info))
+                else:
+                    # Non-1-hot: fall back to greedy placement
+                    placed = False
+                    for batch in batches:
+                        if not any(output_regions_overlap(gen_info['output_region'], r)
+                                   for r in batch['output_regions']):
+                            add_to_batch(batch, gen_info)
+                            placed = True
+                            break
+                    if not placed:
+                        batches.append(make_batch(gen_info))
 
         # Optional logging
-        from nnenum.settings import Settings
         if Settings.LOG_CONV_BATCHING:
             num_gens = mat.shape[1]
             num_batches = len(batches)
@@ -1266,27 +1501,55 @@ class Convolutional2dLayer(Freezable):
 
         shape = self.get_input_shape()
 
-        # Check if batching is likely to be beneficial
         from nnenum.settings import Settings
-        should_batch = True
 
-        if not Settings.CONV_BATCHING_ENABLED:
-            should_batch = False
-        elif self.is_transpose:
-            should_batch = False  # _compute_output_region uses Conv geometry; skip for ConvTranspose
-        elif Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
-            should_batch = False
-        elif star.a_mat.shape[1] > 0:
-            # Check sparsity of first generator only (assumes uniform sparsity)
-            # This avoids the overhead of checking the entire matrix
-            first_gen_sparsity = np.count_nonzero(star.a_mat[:, 0]) / star.a_mat.shape[0]
+        # Determine effective method for this layer
+        method = Settings.CONV_METHOD
+        if self.is_transpose:
+            method = 'dense'  # sparse/_build_conv_matrix not implemented for ConvTranspose
+        elif method == 'batching' and not Settings.CONV_BATCHING_ENABLED:
+            method = 'dense'
+        elif method == 'batching' and Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
+            method = 'dense'
+
+        # Sparsity fallback: both 'batching' and 'sparse' degrade to 'dense' when generators are too dense
+        if method in ('batching', 'sparse') and star.a_mat.shape[1] > 0:
+            from scipy.sparse import issparse as _issparse
+            if _issparse(star.a_mat):
+                first_col = star.a_mat.getcol(0)
+                first_gen_sparsity = first_col.nnz / star.a_mat.shape[0]
+            else:
+                first_gen_sparsity = np.count_nonzero(star.a_mat[:, 0]) / star.a_mat.shape[0]
             if first_gen_sparsity > Settings.CONV_BATCHING_MIN_SPARSITY:
-                should_batch = False
+                method = 'dense'
 
-        if not should_batch:
+        # Generator count fallback: sparse build cost only amortizes for large G
+        if method == 'sparse':
+            G = star.a_mat.shape[1]
+            if G < Settings.CONV_SPARSE_MIN_GENERATORS:
+                method = 'dense'
+
+        if method == 'sparse':
+            Timers.tic('transform_star_sparse_conv')
+            if star.a_mat.shape[1] > 0:
+                result = self._apply_conv_to_mat_sparse(star.a_mat, shape)
+                if Settings.SPARSE_STAR:
+                    # Keep as sparse CSR — densification deferred to FC/MatMul layers
+                    star.a_mat = result
+                else:
+                    star.a_mat = result.toarray().astype(star.a_mat.dtype) if hasattr(result, 'toarray') else result
+            multichannel_state = nn_unflatten(star.bias, shape)
+            multichannel_state = self.execute(multichannel_state)
+            star.bias = nn_flatten(multichannel_state)
+            Timers.toc('transform_star_sparse_conv')
+            assert star.bias.size == star.a_mat.shape[0]
+            return
+
+        if method == 'dense':
             # Vectorized path: apply conv to all generator columns simultaneously
             Timers.tic('transform_star_unbatched')
             if star.a_mat.shape[1] > 0:
+                star.densify()  # _apply_conv_to_mat requires dense input (reshape/im2col)
                 star.a_mat = self._apply_conv_to_mat(star.a_mat, shape)
 
             # bias transformation
@@ -1299,13 +1562,15 @@ class Convolutional2dLayer(Freezable):
             assert star.bias.size == star.a_mat.shape[0]
             return
 
-        # Batch generators to reduce convolution operations
+        # method == 'batching': batch generators to reduce convolution operations
         batches, generator_info = self._batch_generators_for_conv(star.a_mat, shape)
 
         Timers.tic('transform_star_batched_conv')
 
-        # Process each batch
-        result_columns = [None] * star.a_mat.shape[1]
+        output_shape = self.get_output_shape()
+        n_out = int(np.prod(output_shape))
+        G = star.a_mat.shape[1]
+        result = np.zeros((n_out, G), dtype=star.a_mat.dtype)
 
         for batch in batches:
             if len(batch['indices']) == 1:
@@ -1314,9 +1579,7 @@ class Convolutional2dLayer(Freezable):
                 column = generator_info[idx]['column']
                 multichannel_state = nn_unflatten(column, shape)
                 multichannel_state = self.execute(multichannel_state, zero_bias=True)
-                flat = nn_flatten(multichannel_state)
-                flat.shape = (flat.size, 1)
-                result_columns[idx] = flat
+                result[:, idx] = nn_flatten(multichannel_state)
             else:
                 # Multiple non-conflicting generators - combine, convolve once, separate
                 # Key insight: convolution is linear, so conv(sum(g_i)) = sum(conv(g_i))
@@ -1332,32 +1595,27 @@ class Convolutional2dLayer(Freezable):
 
                 # Perform ONE convolution on combined batch
                 combined_result = self.execute(combined, zero_bias=True)
-                combined_result_2d = combined_result  # Shape: (height, width, channels)
 
                 # Extract each generator's contribution using output regions
-                output_shape = self.get_output_shape()
-
+                H_out, W_out, C_out = output_shape
                 for i, idx in enumerate(batch['indices']):
                     output_region = batch['output_regions'][i]
 
-                    if output_region is None:
-                        # Zero generator
-                        flat = np.zeros((np.prod(output_shape), 1), dtype=star.a_mat.dtype)
-                        result_columns[idx] = flat
-                    else:
-                        # Extract output region for this generator
+                    if output_region is not None:
                         out_min_y, out_max_y, out_min_x, out_max_x = output_region
+                        # Write patch directly into pre-allocated result column
+                        patch = combined_result[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :]
+                        ph = out_max_y - out_min_y + 1
+                        pw = out_max_x - out_min_x + 1
+                        # Flat indices of the patch in a (H_out, W_out, C_out) layout
+                        row_starts = (np.arange(ph) + out_min_y) * (W_out * C_out) + out_min_x * C_out
+                        flat_idx = (row_starts[:, None, None]
+                                    + np.arange(pw)[None, :, None] * C_out
+                                    + np.arange(C_out)[None, None, :]).ravel()
+                        result[flat_idx, idx] = patch.ravel()
+                    # else: output_region is None → zero generator, result[:, idx] already zero
 
-                        # Create masked output: zero everywhere except this generator's region
-                        masked_output = np.zeros(output_shape, dtype=star.a_mat.dtype)
-                        masked_output[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :] = \
-                            combined_result_2d[out_min_y:out_max_y+1, out_min_x:out_max_x+1, :]
-
-                        flat = nn_flatten(masked_output)
-                        flat.shape = (flat.size, 1)
-                        result_columns[idx] = flat
-
-        star.a_mat = np.hstack(result_columns)
+        star.a_mat = result
 
         # bias (anchor) transformation includes layer bias
         multichannel_state = nn_unflatten(star.bias, shape)
@@ -1375,24 +1633,79 @@ class Convolutional2dLayer(Freezable):
         # mat_t has one generator PER COLUMN
         shape = self.get_input_shape()
 
-        # Check if batching is likely to be beneficial
         from nnenum.settings import Settings
-        should_batch = True
 
-        if not Settings.CONV_BATCHING_ENABLED:
-            should_batch = False
-        elif self.is_transpose:
-            should_batch = False  # _compute_output_region uses Conv geometry; skip for ConvTranspose
-        elif Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
-            should_batch = False
-        elif zono.mat_t.shape[1] > 0:
-            # Check sparsity of first generator only (assumes uniform sparsity)
-            # This avoids the overhead of checking the entire matrix
-            first_gen_sparsity = np.count_nonzero(zono.mat_t[:, 0]) / zono.mat_t.shape[0]
+        # Determine effective method for this layer
+        method = Settings.CONV_METHOD
+        if self.is_transpose:
+            method = 'dense'  # sparse/_build_conv_matrix not implemented for ConvTranspose
+        elif method == 'batching' and not Settings.CONV_BATCHING_ENABLED:
+            method = 'dense'
+        elif method == 'batching' and Settings.CONV_BATCHING_FIRST_LAYER_ONLY and self.layer_num > 0:
+            method = 'dense'
+
+        from scipy.sparse import issparse
+
+        # If mat_t is already sparse (from a previous sparse conv layer), force sparse method
+        # unless is_transpose (sparse not implemented for ConvTranspose)
+        if issparse(zono.mat_t) and not self.is_transpose:
+            method = 'sparse'
+
+        # Sparsity fallback: both 'batching' and 'sparse' degrade to 'dense' when generators are too dense
+        if method in ('batching', 'sparse') and zono.mat_t.shape[1] > 0:
+            if issparse(zono.mat_t):
+                nnz = zono.mat_t.nnz
+                total = zono.mat_t.shape[0] * zono.mat_t.shape[1]
+                first_gen_sparsity = nnz / max(total, 1)
+            else:
+                first_gen_sparsity = np.count_nonzero(zono.mat_t[:, 0]) / zono.mat_t.shape[0]
             if first_gen_sparsity > Settings.CONV_BATCHING_MIN_SPARSITY:
-                should_batch = False
+                method = 'dense'
+                if issparse(zono.mat_t):
+                    dense_bytes = zono.mat_t.shape[0] * zono.mat_t.shape[1] * 4
+                    if dense_bytes <= Settings.MEMORY_BUDGET_GB * 1e9:
+                        zono.mat_t = zono.mat_t.toarray().astype(np.float32)
+                    # else: leave sparse — dense would OOM, sparse path continues
 
-        if not should_batch:
+        # Generator count fallback: sparse conv matrix build has a large one-time cost that
+        # only amortizes when G is large enough. With few generators, dense im2col is faster.
+        if method == 'sparse' and not issparse(zono.mat_t):
+            G = zono.mat_t.shape[1]
+            if G < Settings.CONV_SPARSE_MIN_GENERATORS:
+                method = 'dense'
+
+        if method == 'sparse':
+            Timers.tic('transform_zono_sparse_conv')
+            if zono.mat_t.shape[1] > 0:
+                zono.mat_t = self._apply_conv_to_mat_sparse(zono.mat_t, shape)
+                # Density gate: convert to dense if sparsity benefit is gone,
+                # but only if the dense form fits within the memory budget.
+                nnz = zono.mat_t.nnz
+                total = zono.mat_t.shape[0] * zono.mat_t.shape[1]
+                dense_bytes = total * 4  # float32
+                if (total > 0 and nnz / total > Settings.CONV_BATCHING_MIN_SPARSITY
+                        and dense_bytes <= Settings.MEMORY_BUDGET_GB * 1e9):
+                    zono.mat_t = zono.mat_t.toarray().astype(np.float32)
+                if Settings.SPARSE_DEBUG:
+                    _nnz = zono.mat_t.nnz if issparse(zono.mat_t) else int(np.count_nonzero(zono.mat_t))
+                    _tot = zono.mat_t.shape[0] * zono.mat_t.shape[1]
+                    print(f"[transform_zono sparse] layer={self.layer_num} "
+                          f"shape={zono.mat_t.shape} nnz={_nnz} density={_nnz/max(_tot,1):.4%} "
+                          f"sparse={issparse(zono.mat_t)}", flush=True)
+            multichannel_state = nn_unflatten(zono.center, shape)
+            multichannel_state = self.execute(multichannel_state)
+            zono.center = nn_flatten(multichannel_state)
+            Timers.toc('transform_zono_sparse_conv')
+            assert zono.center.size == zono.mat_t.shape[0]
+            return
+
+        if method == 'dense':
+            # Ensure dense (in case mat_t arrived sparse but below threshold wasn't caught above)
+            if issparse(zono.mat_t):
+                dense_bytes = zono.mat_t.shape[0] * zono.mat_t.shape[1] * 4
+                if dense_bytes <= Settings.MEMORY_BUDGET_GB * 1e9:
+                    zono.mat_t = zono.mat_t.toarray().astype(np.float32)
+                # else: leave sparse — dense would OOM
             # Vectorized path: apply conv to all generator columns simultaneously
             Timers.tic('transform_zono_unbatched')
             if zono.mat_t.shape[1] > 0:
@@ -1408,7 +1721,7 @@ class Convolutional2dLayer(Freezable):
             assert zono.center.size == zono.mat_t.shape[0]
             return
 
-        # Batch generators to reduce convolution operations
+        # method == 'batching': batch generators to reduce convolution operations
         batches, generator_info = self._batch_generators_for_conv(zono.mat_t, shape)
 
         Timers.tic('transform_zono_batched_conv')

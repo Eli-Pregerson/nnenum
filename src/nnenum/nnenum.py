@@ -207,6 +207,21 @@ def set_exact_settings():
 
     Settings.BRANCH_MODE = Settings.BRANCH_EXACT
 
+def set_vggnet_settings():
+    'set settings for VGGNet-scale networks (150K+ inputs, sparse generator path)'
+
+    # Start from image settings as a base (keeps BRANCH_OVERAPPROX for specs 0-14)
+    set_image_settings()
+
+    # Keep star.a_mat sparse through conv layers — avoids ~1.9TB dense allocation at layer 0.
+    # No-op for specs with G < CONV_SPARSE_MIN_GENERATORS (falls back to dense path).
+    Settings.SPARSE_STAR = True
+
+    # When sparse a_mat would still OOM (specs 15-17: 150K gens grow to ~448GB by layer 19),
+    # collapse to per-neuron interval star and continue propagation from there.
+    Settings.SPARSE_INTERVAL_FALLBACK = True
+    Settings.TRY_IBP = True  # try IBP first from the collapsed intervals (fast, O(neurons))
+
 def set_image_settings():
     'set settings for larger image benchmarks'
 
@@ -223,6 +238,8 @@ def set_image_settings():
     #Settings.OVERAPPROX_CONTRACT_ZONO_LP = False
     Settings.CONTRACT_ZONOTOPE = False
     Settings.CONTRACT_ZONOTOPE_LP = False
+
+    Settings.CONV_BATCHING_ENABLED = True
 
 def main():
     'main entry point'
@@ -355,7 +372,7 @@ def main():
         set_control_settings()
         Settings.LP_SOLVER = "Gurobi"
     elif "vggnet16" in settings_str:
-        set_image_settings()
+        set_vggnet_settings()
     elif "acasxu" in settings_str:
         set_control_settings()
     elif "collins_rul_cnn" in settings_str:
@@ -411,7 +428,7 @@ def main():
         res = enumerate_network(init_box, network, spec)
         result_str = res.result_str
 
-        if timeout is not None:
+        if timeout is not None and res.total_secs is not None:
             # reduce timeout by the runtime
             timeout -= res.total_secs
 

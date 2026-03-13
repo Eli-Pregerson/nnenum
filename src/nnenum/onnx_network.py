@@ -19,6 +19,16 @@ from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer,
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
+def _tensor_to_numpy(init):
+    """Read an ONNX TensorProto initializer as a float32 numpy array.
+
+    Handles both raw_data (compact binary) and float_data (repeated field) storage formats.
+    Models like VGGNet use float_data; most other models use raw_data.
+    """
+    if len(init.raw_data) > 0:
+        return np.frombuffer(init.raw_data, dtype='<f4')
+    return np.array(init.float_data, dtype=np.float32)
+
 from nnenum.util import Freezable
 
 class LinearOnnxSubnetworkLayer(Freezable):
@@ -446,7 +456,7 @@ def load_onnx_network_optimized(filename):
             init = init_map[cur_node.input[1]]
             assert init.data_type == onnx_type_float
 
-            b = np.frombuffer(init.raw_data, dtype='<f4') # little endian float32
+            b = _tensor_to_numpy(init)
                 # note shapes are not reversed here... acasxu input is 1, 1, 1, 5, but dim_value is 1, 1, 1, 5
             shape = tuple(d for d in init.dims) # note dims reversed, acasxu has 5, 50 but want 5 cols
             b = nn_unflatten(b, shape, order='F')
@@ -476,7 +486,11 @@ def load_onnx_network_optimized(filename):
 
             layer = ConstantLayer(len(layers), value)
         elif op == 'Flatten':
-            assert cur_node.attribute[0].i == 1 # flatten along columns
+            # axis attribute defaults to 1 per ONNX spec (flatten all dims after batch)
+            axis = 1
+            if cur_node.attribute:
+                axis = cur_node.attribute[0].i
+            assert axis == 1  # flatten along columns
 
             layer = FlattenLayer(len(layers), prev_shape)
             
@@ -486,7 +500,7 @@ def load_onnx_network_optimized(filename):
             
             assert init.data_type == onnx_type_float
 
-            b = np.frombuffer(init.raw_data, dtype='<f4') # little endian float32
+            b = _tensor_to_numpy(init)
             shape = tuple(d for d in reversed(init.dims)) # note dims reversed, acasxu has 5, 50 but want 5 cols
 
             b = nn_unflatten(b, shape, order='F')
@@ -505,22 +519,24 @@ def load_onnx_network_optimized(filename):
 
             # weight
             assert weight_init.data_type == onnx_type_float
-            b = np.frombuffer(weight_init.raw_data, dtype='<f4') # little endian float32
+            b = _tensor_to_numpy(weight_init)
             shape = tuple(d for d in reversed(weight_init.dims)) # note dims reversed, acasxu has 5, 50 but want 5 cols
             weight_mat = nn_unflatten(b, shape, order='F')
 
             # bias
             assert bias_init.data_type == onnx_type_float
-            b = np.frombuffer(bias_init.raw_data, dtype='<f4') # little endian float32
+            b = _tensor_to_numpy(bias_init)
             shape = tuple(d for d in reversed(bias_init.dims)) # note dims reversed, acasxu has 5, 50 but want 5 cols
             bias_vec = nn_unflatten(b, shape, order='F')
 
             for a in cur_node.attribute:
-                assert a.name in ['alpha', 'beta', 'transB'], "general Gemm node unsupported"
+                assert a.name in ['alpha', 'beta', 'transA', 'transB'], "general Gemm node unsupported"
 
                 if a.name in ['alpha', 'beta']:
                     assert a.f == 1.0
                     assert a.type == onnx_type_float
+                elif a.name == 'transA':
+                    assert a.i == 0, "transA=1 not supported"
                 elif a.name == 'transB':
                     assert a.type == onnx_type_int
                     assert a.i == 1
@@ -536,7 +552,7 @@ def load_onnx_network_optimized(filename):
             assert weight_init.data_type == onnx_type_float
 
             # ONNX Conv weight shape: (out_channels, in_channels, kernel_h, kernel_w)
-            kernels = np.frombuffer(weight_init.raw_data, dtype='<f4')
+            kernels = _tensor_to_numpy(weight_init)
             kernel_shape = tuple(d for d in weight_init.dims)
             kernels = kernels.reshape(kernel_shape)
 
@@ -544,7 +560,7 @@ def load_onnx_network_optimized(filename):
             if len(cur_node.input) == 3:
                 bias_init = init_map[cur_node.input[2]]
                 assert bias_init.data_type == onnx_type_float
-                biases = np.frombuffer(bias_init.raw_data, dtype='<f4')
+                biases = _tensor_to_numpy(bias_init)
             else:
                 # No bias provided, use zeros
                 biases = np.zeros(kernel_shape[0], dtype=np.float32)
@@ -668,10 +684,10 @@ def load_onnx_network_optimized(filename):
             mean_init = init_map[cur_node.input[3]]   # running_mean
             var_init = init_map[cur_node.input[4]]    # running_var
 
-            scale = np.frombuffer(scale_init.raw_data, dtype='<f4')
-            bias = np.frombuffer(bias_init.raw_data, dtype='<f4')
-            mean = np.frombuffer(mean_init.raw_data, dtype='<f4')
-            var = np.frombuffer(var_init.raw_data, dtype='<f4')
+            scale = _tensor_to_numpy(scale_init)
+            bias = _tensor_to_numpy(bias_init)
+            mean = _tensor_to_numpy(mean_init)
+            var = _tensor_to_numpy(var_init)
 
             # Get epsilon from attributes (default 1e-5)
             epsilon = 1e-5
@@ -743,6 +759,9 @@ def load_onnx_network_optimized(filename):
                     flat_shift = bn_shift.astype(np.float64)
 
                 layer = ScaleLayer(len(layers), flat_scale, flat_shift, prev_output_shape)
+        elif op == 'Dropout':
+            # Dropout is identity at inference time — no layer needed, just pass through
+            layer = None
         else:
             assert False, f"unsupported onnx op_type {op} in node {cur_node.name}"
 

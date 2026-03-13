@@ -1,21 +1,23 @@
 """
 Collect timing data for conv-layer instances.
 
-For each decided (sat/unsat) conv instance found in all_results_batching.csv, this script:
-  - Runs the instance with conv batching ENABLED and records total time + conv time
-  - Runs the instance with conv batching DISABLED (with extended timeout) and records the same
+For each decided (sat/unsat) conv instance found in all_results_batching.csv, this script
+runs the instance three ways and records total time + conv time for each:
+  - CONV_METHOD='batching'  (greedy spatial grouping + im2col batched matmul)
+  - CONV_METHOD='dense'     (unbatched im2col matmul on all generators at once)
+  - CONV_METHOD='sparse'    (prebuilt Toeplitz sparse matrix W; scipy sparse @ gen_mat)
 
 Output CSV (conv_timing_data.csv):
   category, onnx_path, vnnlib_path, settings_str,
-  batching_total_secs, batching_conv_secs,
-  nobatch_total_secs, nobatch_conv_secs,
-  batching_result, nobatch_result
+  batching_total_secs, batching_conv_secs, batching_result,
+  dense_total_secs,    dense_conv_secs,    dense_result,
+  sparse_total_secs,   sparse_conv_secs,   sparse_result
 
 Usage:
-  PYTHONPATH=src python3 run_conv_timing.py [--top N] [--nobatch-timeout-mult X]
+  PYTHONPATH=src python3 run_conv_timing.py [--top N] [--timeout-mult X]
 
-  --top N             Only run the N slowest instances (default 20)
-  --nobatch-timeout-mult X  Multiply timeout by X for the no-batching run (default 3.0)
+  --top N          Only run the N slowest instances (default 20)
+  --timeout-mult X Multiply baseline runtime by X for the timeout of each run (default 3.0)
 """
 
 import sys
@@ -33,16 +35,13 @@ from nnenum.onnx_network import load_onnx_network_optimized, load_onnx_network
 from nnenum.nnenum import make_spec, set_image_settings
 
 # ── Timer names we want to capture ────────────────────────────────────────────
-# With NUM_PROCESSES=1 (forced in configure_settings), the worker runs in the main
-# process and shares the same Timers global.  The worker's _save_timers_to_shared()
-# scans Timers.top_level_timer recursively, picking up BOTH the initial
-# propagate_up_to_split star pass and all subsequent worker zono passes.
-# res.timers therefore contains the full conv cost — no separate main-process read needed.
 CONV_TIMERS = [
     'transform_star_batched_conv',
     'transform_star_unbatched',
+    'transform_star_sparse_conv',
     'transform_zono_batched_conv',
     'transform_zono_unbatched',
+    'transform_zono_sparse_conv',
     'batch_generators_for_conv',
 ]
 
@@ -63,26 +62,26 @@ SETTINGS_MAP = {
 }
 
 
-def configure_settings(settings_str: str, timeout: float, batching: bool):
-    """Apply image settings for the given benchmark, then override batching flag."""
+def configure_settings(settings_str: str, timeout: float, method: str):
+    """Apply image settings for the given benchmark, then set the conv method.
+
+    method: 'batching' | 'dense' | 'sparse'
+    """
     set_image_settings()
     Settings.TIMING_STATS = True
     Settings.RESULT_SAVE_TIMERS = CONV_TIMERS
     Settings.TIMEOUT = timeout
     Settings.PRINT_OUTPUT = False
     Settings.PRINT_PROGRESS = False
-    Settings.CONV_BATCHING_ENABLED = batching
-    # Force single-process so main-process conv timers (transform_star in
-    # propagate_up_to_split) are visible.  With multiple workers, RESULT_SAVE_TIMERS
-    # only captures worker-side zono passes and misses the star-init conv cost entirely
-    # (e.g. malbeware shows 0% conv with >1 process even though conv is ~48% of work).
-    Settings.NUM_PROCESSES = 1
+    Settings.CONV_METHOD = method
+    # 'batching' requires CONV_BATCHING_ENABLED=True; other methods ignore it.
+    Settings.CONV_BATCHING_ENABLED = (method == 'batching')
 
 
 def run_one(onnx_path: str, vnnlib_path: str, settings_str: str,
-            timeout: float, batching: bool) -> dict:
+            timeout: float, method: str) -> dict:
     """Run a single instance and return timing dict."""
-    configure_settings(settings_str, timeout, batching)
+    configure_settings(settings_str, timeout, method)
 
     try:
         network = load_onnx_network_optimized(onnx_path)
@@ -107,11 +106,9 @@ def run_one(onnx_path: str, vnnlib_path: str, settings_str: str,
 
         res = enumerate_network(init_box_np, network, spec)
 
-        # With NUM_PROCESSES=1 (forced in configure_settings), the worker runs in-process
-        # and shares the same Timers tree as the main process.  The worker's
-        # _save_timers_to_shared() call reads Timers.top_level_timer recursively, which
-        # includes BOTH the initial propagate_up_to_split star pass AND all worker zono
-        # passes.  So res.timers already captures the full conv cost.
+        # enumerate_network now merges both worker timers (shared.timer_secs) and
+        # main-process timers (Timers.top_level_timer) into res.timers, so the full
+        # conv cost is captured regardless of NUM_PROCESSES.
         for name in CONV_TIMERS:
             if name in res.timers:
                 _, secs = res.timers[name]
@@ -150,11 +147,13 @@ def has_conv_transpose(onnx_path: str) -> bool:
 # Cache ConvTranspose check results to avoid re-loading the same ONNX file repeatedly
 _conv_transpose_cache: dict = {}
 
-def load_candidates(top_n: int) -> list:
+def load_candidates(top_n: int, max_baseline: float = np.inf) -> list:
     """Load the top_n slowest decided conv instances from the batching CSV.
 
     Skips instances whose ONNX file contains ConvTranspose layers (not yet supported
     in the optimized path — see GOALS.md item 2).
+
+    max_baseline: skip instances whose baseline runtime exceeds this threshold.
     """
     rows = []
     with open(RESULTS_CSV, newline='') as f:
@@ -170,6 +169,8 @@ def load_candidates(top_n: int) -> list:
                 rt = float(runtime)
             except ValueError:
                 continue
+            if rt > max_baseline:
+                continue
             if onnx not in _conv_transpose_cache:
                 _conv_transpose_cache[onnx] = has_conv_transpose(onnx)
             if _conv_transpose_cache[onnx]:
@@ -180,15 +181,26 @@ def load_candidates(top_n: int) -> list:
     return rows[:top_n]
 
 
+def _fmt(r: dict) -> str:
+    """Format a run_one result for console output."""
+    if r['total_secs'] < 0:
+        return f"ERROR"
+    pct = 100 * r['conv_secs'] / max(r['total_secs'], 1e-6)
+    return (f"{r['result']}  total={r['total_secs']:.2f}s  "
+            f"conv={r['conv_secs']:.2f}s ({pct:.1f}%)")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Conv timing analysis')
     parser.add_argument('--top', type=int, default=20,
                         help='Number of slowest instances to analyse (default 20)')
-    parser.add_argument('--nobatch-timeout-mult', type=float, default=3.0,
-                        help='Multiply baseline runtime by this for no-batching timeout (default 3.0)')
+    parser.add_argument('--timeout-mult', type=float, default=3.0,
+                        help='Multiply baseline runtime by this for per-run timeout (default 3.0)')
+    parser.add_argument('--max-baseline', type=float, default=np.inf,
+                        help='Skip instances whose baseline runtime exceeds this (default: no limit)')
     args = parser.parse_args()
 
-    candidates = load_candidates(args.top)
+    candidates = load_candidates(args.top, max_baseline=args.max_baseline)
     print(f"Collected {len(candidates)} candidate instances (top {args.top} by batching runtime).")
 
     # Write header immediately so the file exists even if we crash partway
@@ -196,50 +208,55 @@ def main():
         w = csv.writer(f)
         w.writerow([
             'category', 'onnx_path', 'vnnlib_path', 'settings_str',
-            'batching_total_secs', 'batching_conv_secs',
-            'nobatch_total_secs', 'nobatch_conv_secs',
-            'batching_result', 'nobatch_result',
+            'batching_total_secs', 'batching_conv_secs', 'batching_result',
+            'dense_total_secs',    'dense_conv_secs',    'dense_result',
+            'sparse_total_secs',   'sparse_conv_secs',   'sparse_result',
         ])
 
     for i, (baseline_rt, cat, onnx_path, vnnlib_path) in enumerate(candidates):
         settings_str = SETTINGS_MAP.get(cat, 'image')
-        nobatch_timeout = max(baseline_rt * args.nobatch_timeout_mult, 60.0)
+        timeout = max(baseline_rt * args.timeout_mult, 60.0)
 
         print(f"\n[{i+1}/{len(candidates)}] {cat} | {os.path.basename(onnx_path)} | "
               f"{os.path.basename(vnnlib_path)}")
-        print(f"  Baseline runtime: {baseline_rt:.1f}s  |  No-batch timeout: {nobatch_timeout:.0f}s")
+        print(f"  Baseline runtime: {baseline_rt:.1f}s  |  Per-run timeout: {timeout:.0f}s")
 
-        # ── Run WITH batching ──────────────────────────────────────────────────
-        print("  Running WITH batching...", end=' ', flush=True)
+        err_sentinel = {'result': 'error', 'total_secs': -1.0, 'conv_secs': -1.0}
+
+        # ── batching ──────────────────────────────────────────────────────────
+        print("  [batching] ", end='', flush=True)
         try:
-            bat = run_one(onnx_path, vnnlib_path, settings_str,
-                          timeout=nobatch_timeout, batching=True)
-            print(f"done: {bat['result']}  total={bat['total_secs']:.2f}s  "
-                  f"conv={bat['conv_secs']:.2f}s "
-                  f"({100*bat['conv_secs']/max(bat['total_secs'],1e-6):.1f}%)")
+            bat = run_one(onnx_path, vnnlib_path, settings_str, timeout=timeout, method='batching')
+            print(_fmt(bat))
         except Exception as e:
             print(f"ERROR: {e}")
-            bat = {'result': f'error:{e}', 'total_secs': -1.0, 'conv_secs': -1.0}
+            bat = dict(err_sentinel, result=f'error:{e}')
 
-        # ── Run WITHOUT batching ───────────────────────────────────────────────
-        print("  Running WITHOUT batching...", end=' ', flush=True)
+        # ── dense ─────────────────────────────────────────────────────────────
+        print("  [dense]    ", end='', flush=True)
         try:
-            nob = run_one(onnx_path, vnnlib_path, settings_str,
-                          timeout=nobatch_timeout, batching=False)
-            print(f"done: {nob['result']}  total={nob['total_secs']:.2f}s  "
-                  f"conv={nob['conv_secs']:.2f}s "
-                  f"({100*nob['conv_secs']/max(nob['total_secs'],1e-6):.1f}%)")
+            den = run_one(onnx_path, vnnlib_path, settings_str, timeout=timeout, method='dense')
+            print(_fmt(den))
         except Exception as e:
             print(f"ERROR: {e}")
-            nob = {'result': f'error:{e}', 'total_secs': -1.0, 'conv_secs': -1.0}
+            den = dict(err_sentinel, result=f'error:{e}')
+
+        # ── sparse ────────────────────────────────────────────────────────────
+        print("  [sparse]   ", end='', flush=True)
+        try:
+            spa = run_one(onnx_path, vnnlib_path, settings_str, timeout=timeout, method='sparse')
+            print(_fmt(spa))
+        except Exception as e:
+            print(f"ERROR: {e}")
+            spa = dict(err_sentinel, result=f'error:{e}')
 
         # ── Append row to CSV ─────────────────────────────────────────────────
         with open(OUTPUT_CSV, 'a', newline='') as f:
             csv.writer(f).writerow([
                 cat, onnx_path, vnnlib_path, settings_str,
-                bat['total_secs'], bat['conv_secs'],
-                nob['total_secs'], nob['conv_secs'],
-                bat['result'], nob['result'],
+                bat['total_secs'], bat['conv_secs'], bat['result'],
+                den['total_secs'], den['conv_secs'], den['result'],
+                spa['total_secs'], spa['conv_secs'], spa['result'],
             ])
 
         print(f"  -> Row written to {OUTPUT_CSV}")

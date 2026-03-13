@@ -4,7 +4,37 @@ Ordered by current priority (subject to change). Remove items when complete; add
 
 ---
 
-## 1. Conv Timing Analysis (Highest Priority)
+## 1. VGGNet Support via Full Sparse Conv-ReLU Path (Highest Priority)
+
+**Goal**: Get results on `vggnet16_2022` (18 instances, 224×224×3 input, 13 conv + 5 MaxPool + 3 dense layers). VGGNet is memory-bound for dense tools — the hope is to pass instances no other tool can handle by staying in sparse representation through the early layers.
+
+**Why sparse matters here**: A one-hot generator has 150K elements but only 64–576 nonzeros through the first two conv blocks. Dense representation requires `150K × G` floats — prohibitive for large G. Sparse stays feasible. Generators cross the 5% density threshold only after pool2 (layer ~16 of 41), so ~40% of the network benefits.
+
+**Two bugs to fix first**:
+1. **float_data vs raw_data** (`src/nnenum/onnx_network.py`): VGGNet stores weights in `float_data`, not `raw_data`. Add `_tensor_to_numpy(init)` helper and replace all `np.frombuffer(init.raw_data, ...)` calls. `onnx.numpy_helper.to_array()` handles this correctly and could be used as alternative.
+2. **MaxPool**: Handled externally by user (preprocessing ONNX to replace MaxPool with ReLU-based equivalent).
+
+**Sparse conv-ReLU path** (`CONV_METHOD='sparse'`, keep mat_t as CSC through layers):
+- `_apply_conv_to_mat_sparse` → return `csc_matrix` instead of calling `.toarray()`
+- `transform_zono` → store sparse `mat_t`; convert to dense when density > `CONV_BATCHING_MIN_SPARSITY`
+- `update_zono` (`overapprox.py`) → sparse-aware: row zeroing (LIL conversion), row scaling (CSR conversion), new generator hstack (`scipy.sparse.hstack`)
+- `box_bounds()` and other zonotope ops → audit `mat_t` usages, add `.toarray()` where 1D dense needed
+- `DeepPolyOverapprox.__init__` → densify `mat_t` before copying to `ubcoef`/`lbcoef`
+- Star `a_mat` stays dense (LP construction assumes dense — too invasive to change)
+
+**Implementation order**: (1) fix float_data bug → (2) verify loading with preprocessed VGGNet → (3) return CSC from sparse conv → (4) store sparse mat_t + density gate → (5) sparse-aware ReLU update → (6) zonotope op audit → (7) end-to-end test
+
+**Relevant code**:
+- `src/nnenum/onnx_network.py`: weight loading, ~lines 449, 489, 508, 514, 539, 547, 671–674
+- `src/nnenum/network.py`: `_apply_conv_to_mat_sparse`, `transform_zono`
+- `src/nnenum/overapprox.py`: `update_zono`, `relu_update_best_area_zono`, `DeepPolyOverapprox.__init__`
+- `src/nnenum/zonotope.py`: `box_bounds()` and all `mat_t` usages
+
+**Status**: Not started (plan written 2026-03-08)
+
+---
+
+## 2. Conv Timing Analysis (deprioritized — dense is now default, batching obsolete)
 
 **Goal**: Find the hardest conv instances nnenum can still decide, profile them to understand where time is spent, and assess how much further speedup is achievable in the conv path.
 
@@ -46,26 +76,34 @@ Ordered by current priority (subject to change). Remove items when complete; add
 
 ## 3. Sparse Matrix Conv Method
 
-**Goal**: Implement an alternative conv path using sparse matrix representations and benchmark against the current generator-batching approach.
+**Status**: Partially complete — `CONV_METHOD='sparse'` implemented in `network.py` (sparse Toeplitz W, `_apply_conv_to_mat_sparse`, `_build_conv_matrix`). Benchmarking showed sparse wins for large-image early layers (0.68–0.89x of dense). The next step — propagating sparse mat_t through ReLU — is now item 1.
+
+---
+
+## 4. LP Solver Comparison
+
+**Goal**: Evaluate alternative LP solvers against the current GLPK backend to measure their impact on verification throughput.
+
+**Context**: nnenum uses GLPK (via `swiglpk`) for LP solving, which is the performance bottleneck for hard instances requiring many ReLU splits. The `Settings.LP_SOLVER` setting already supports `'GLPK'` and `'Gurobi'` as options. Other solvers (HiGHS, CPLEX, Mosek, SoPlex) may offer significant speedups, especially on the dense LPs that arise from deep splitting.
 
 **Approach**:
-- Express convolution as a sparse matrix-vector product: build the Toeplitz-like sparse matrix for the conv kernel, then apply it to a batch of generators at once
-- Use `scipy.sparse` (already imported in `onnx_network.py`) for the sparse matrix
-- Compare: (a) current batching approach, (b) sparse matmul approach, (c) naive unbatched baseline
-- Key trade-off: batching avoids the overhead of constructing the sparse matrix; sparse matmul may win for layers where batching compression is low
+- Identify the slowest decided instances where LP time dominates (low conv%, high total time)
+- Profile LP call count and time per call using `Settings.TIMING_STATS = True`
+- Add support for at least one additional solver (HiGHS is free, fast, and has a Python interface via `highspy`)
+- Run the same instances with each solver and compare total verification time
+- Key files: `src/nnenum/lpinstance.py`, `src/nnenum/lpinstance_glpk.py`, `src/nnenum/settings.py`
 
 **Relevant code**:
-- `src/nnenum/network.py`: `Convolutional2dLayer` — add alternative `transform_star_sparse()` method
-- `src/nnenum/onnx_network.py`: `from scipy.sparse import csc_matrix, csr_matrix` already imported
-- `src/nnenum/settings.py`: add `CONV_METHOD` setting to switch between approaches
-
-**Prerequisite**: Complete item 1 first — timing analysis will clarify whether the conv path is the bottleneck and which layer indices matter most.
+- `src/nnenum/lpinstance.py`: LP abstraction layer
+- `src/nnenum/lpinstance_glpk.py`: GLPK implementation
+- `src/nnenum/lpinstance_gb.py`: Gurobi implementation (exists but requires license)
+- `src/nnenum/settings.py`: `LP_SOLVER`, `GLPK_TIMEOUT`, `GLPK_FIRST_PRIMAL`
 
 **Status**: Not started
 
 ---
 
-## 3. Skip Connections / DAG Structures
+## 5. Skip Connections / DAG Structures
 
 **Goal**: Support residual/skip connections (Add nodes where one input is not the immediately preceding layer's output) and other non-sequential graph topologies.
 

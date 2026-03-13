@@ -154,7 +154,7 @@ def compress_init_box(input_box, tol=1e-9):
     assert dtype in [float, np.float64, np.float32], f"input_box dtype should be float32/64, got {dtype}"
     cur_bias = np.array([0] * inputs, dtype=dtype)
 
-    cur_bm_transpose = []
+    free_dims = []
     new_input_box = []
 
     for dim, (lb, ub) in enumerate(input_box):
@@ -165,11 +165,23 @@ def compress_init_box(input_box, tol=1e-9):
             cur_bias[dim] = mid
         else:
             new_input_box.append((lb, ub))
+            free_dims.append(dim)
 
-            # add column from identity matrix to cur_bm
-            cur_bm_transpose.append([1 if d == dim else 0 for d in range(inputs)])
+    G = len(free_dims)
 
-    cur_bm = np.array(cur_bm_transpose, dtype=dtype).transpose()
+    # For large G, building a dense (inputs, G) matrix would OOM (e.g. 150K×150K = 180 GB).
+    # Use a sparse column-selection matrix instead.
+    from nnenum.settings import Settings
+    dense_bytes = inputs * G * 8  # float64 worst case
+    if Settings.SPARSE_STAR and dense_bytes > Settings.MEMORY_BUDGET_GB * 1e9:
+        from scipy.sparse import csr_matrix
+        rows = free_dims
+        cols = list(range(G))
+        data = [1.0] * G
+        cur_bm = csr_matrix((data, (rows, cols)), shape=(inputs, G), dtype=dtype)
+    else:
+        cur_bm_transpose = [[1 if d == dim else 0 for d in range(inputs)] for dim in free_dims]
+        cur_bm = np.array(cur_bm_transpose, dtype=dtype).transpose()
 
     return cur_bm, cur_bias, new_input_box
 

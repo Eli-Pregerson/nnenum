@@ -300,16 +300,16 @@ class Prefilter(Freezable):
 
         ### try shrinking prefilter zonotopes ###
         if Settings.CONTRACT_ZONOTOPE:
-            row = pos_star.a_mat[i]
+            row = pos_star.get_row(i)
             bias = pos_star.bias[i]
-        
+
             Timers.tic("contract_zonotope")
             pos.zono.contract_domain(-row, bias)
             neg.zono.contract_domain(row, -bias)
             Timers.toc("contract_zonotope")
-            
+
         if Settings.CONTRACT_ZONOTOPE_LP:
-            row = pos_star.a_mat[i]
+            row = pos_star.get_row(i)
             bias = pos_star.bias[i]
             
             Timers.tic("contract_zonotope_lp")
@@ -362,7 +362,7 @@ class Prefilter(Freezable):
         Timers.tic('assign_zeros')
 
         star.bias[zero_indices] = 0
-        star.a_mat[zero_indices] = 0
+        star.set_row_zero(zero_indices)
 
         if self.simulation is not None:
             self.simulation[1][zero_indices] = 0

@@ -22,7 +22,8 @@ class LpStar(Freezable):
     '''
 
     def __init__(self, a_mat, bias, box_bounds=None):
-        assert a_mat is None or isinstance(a_mat, np.ndarray)
+        from scipy.sparse import issparse
+        assert a_mat is None or isinstance(a_mat, np.ndarray) or issparse(a_mat)
         assert bias is None or isinstance(bias, np.ndarray)
 
         if Settings.LP_SOLVER == 'GLPK':
@@ -76,6 +77,68 @@ class LpStar(Freezable):
                 self.init_bias = self.bias.copy()
 
         self.freeze_attrs()
+
+    # ------------------------------------------------------------------
+    # Sparse a_mat helpers — keep sparse/dense dispatch in one place
+    # ------------------------------------------------------------------
+
+    def is_sparse(self):
+        'returns True if a_mat is a scipy sparse matrix'
+        from scipy.sparse import issparse
+        return issparse(self.a_mat)
+
+    def get_row(self, i):
+        'returns row i of a_mat as a dense 1-D numpy array'
+        if self.is_sparse():
+            return np.asarray(self.a_mat.getrow(i).todense()).ravel()
+        return self.a_mat[i]
+
+    def set_row_zero(self, indices):
+        'zero out one or more rows of a_mat (in-place)'
+        if self.is_sparse():
+            mat = self.a_mat.tocsr()
+            idx_iter = indices if hasattr(indices, '__len__') else [indices]
+            for i in idx_iter:
+                mat.data[mat.indptr[i]:mat.indptr[i + 1]] = 0
+            mat.eliminate_zeros()
+            self.a_mat = mat
+        else:
+            self.a_mat[indices] = 0
+
+    def densify(self):
+        'convert a_mat to a dense numpy array in-place (no-op if already dense)'
+        if self.is_sparse():
+            self.a_mat = self.a_mat.toarray().astype(np.float32)
+
+    def collapse_to_interval_star_from_bounds(self, lb, ub):
+        '''Replace a_mat with a diagonal interval overapproximation from given per-neuron bounds.
+
+        lb, ub: float32 arrays of length N giving the min/max of each neuron in the current set.
+        After this call:
+          bias[i]  = (lb[i] + ub[i]) / 2
+          a_mat    = diag((ub - lb) / 2)   sparse (N, N) CSR diagonal
+          lpi      = fresh with N double-bounded columns in [-1, 1]
+
+        Caller must rewire zono.mat_t, zono.center, and zono.init_bounds to the new arrays.
+        '''
+        from scipy.sparse import diags as sp_diags
+
+        N = len(lb)
+        self.bias = ((lb + ub) / 2).astype(np.float32)
+        self.a_mat = sp_diags((ub - lb).astype(np.float32) / 2, format='csr')
+
+        if Settings.LP_SOLVER == 'GLPK':
+            from nnenum.lpinstance_glpk import LpInstanceGLPK as LpInstance
+        else:
+            from nnenum.lpinstance_gb import LpInstanceGB as LpInstance
+        self.lpi = LpInstance()
+        for i in range(N):
+            self.lpi.add_double_bounded_cols([f'iv{i}'], -1.0, 1.0)
+
+        self.init_bm = None
+        self.init_bias = None
+        self.input_bounds_witnesses = None
+        self.last_lp_result = None
 
     def __str__(self):
         rv = "LpStar with a_mat:\n"
@@ -442,7 +505,7 @@ class LpStar(Freezable):
         if self.a_mat.size == 0:
             value = self.bias
         else:
-            row = self.a_mat[output_index]
+            row = self.get_row(output_index)
 
             if maximize:
                 row = -1 * row
@@ -454,7 +517,7 @@ class LpStar(Freezable):
             assert len(lp_result) == num_init_vars
 
             # single row
-            value = self.a_mat[output_index].dot(lp_result) + self.bias[output_index]
+            value = self.get_row(output_index).dot(lp_result) + self.bias[output_index]
 
         Timers.toc('minimize_output')
 
@@ -646,6 +709,10 @@ class LpStar(Freezable):
 
         Timers.tic('execute_relus_overapprox')
 
+        # Safety net: if a_mat is still sparse (Conv→ReLU without intervening FC),
+        # densify before the overapprox which requires hstack and direct row assignment.
+        self.densify()
+
         # overapprox can set star to None if no LP optimization is needed
         num_outputs = self.a_mat.shape[0]
         assert len(layer_bounds) == num_outputs, f"outputs is {num_outputs}, but num " + \
@@ -701,7 +768,7 @@ class LpStar(Freezable):
 
         assert a_mat_width <= num_cols, f"a_mat_width: {a_mat_width}, num_cols: {num_cols}"
 
-        row[:a_mat_width] = self.a_mat[i, :]
+        row[:a_mat_width] = self.get_row(i)
         row[-1] = -1
         self.lpi.add_dense_row(row, -self.bias[i])
 
@@ -710,7 +777,7 @@ class LpStar(Freezable):
         # x[i] equals row i in the basis matrix
         factor = ub / (ub - lb)
         row = np.zeros((num_cols,), dtype=self.a_mat.dtype)
-        row[:self.a_mat.shape[1]] = -1 * factor * self.a_mat[i]
+        row[:self.a_mat.shape[1]] = -1 * factor * self.get_row(i)
         row[-1] = 1
         rhs = -lb * factor + self.bias[i] * factor
         self.lpi.add_dense_row(row, rhs)
@@ -720,7 +787,7 @@ class LpStar(Freezable):
         self.bias[i] = 0
 
         # ReLU case, introduce new variable
-        self.a_mat[i] = 0
+        self.set_row_zero(i)
 
         new_generators_bm[i, num_zeros] = 1
 

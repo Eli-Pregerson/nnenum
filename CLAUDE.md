@@ -163,6 +163,24 @@ Since convolution is **linear** (`conv(a + b) = conv(a) + conv(b)`) and generato
 - **Third conv layer**: Further degradation (~1.4% sparsity) → 4.0x compression → marginal benefit
 - **Dense layers** (>5% sparsity): Batching skipped automatically to avoid overhead
 
+### Sparse Conv Matrix Path
+
+An alternative to batching for very large generator counts (VGGNet-scale). Instead of batching individual convolutions, builds a sparse Toeplitz matrix representing the convolution and multiplies all generators at once: `conv_matrix @ gen_matrix`.
+
+**Switching logic** (two independent conditions, both must be true to use sparse):
+1. **Sparsity**: `nnz / (rows × cols) < Settings.CONV_BATCHING_MIN_SPARSITY` (default 5%) — generators must be sparse enough that the sparse multiply is cheaper than dense
+2. **Generator count**: `G >= Settings.CONV_SPARSE_MIN_GENERATORS` (default 5000) — enough generators that the one-time cost of building `conv_matrix` amortizes across multiplications
+
+If either condition fails, falls back to dense path. These are checked independently in both `transform_zono` and `transform_star`.
+
+**Memory guard** (`Settings.MEMORY_BUDGET_GB`, default 8.0 GB): In `update_zono`, before converting sparse mat_t to dense for ReLU processing, checks if `rows × cols × 4 bytes > budget`. If over budget, routes to `_update_zono_sparse` instead of densifying.
+
+**Key cost**: `_build_conv_matrix` for VGGNet layer 0 takes ~21.5s and produces a (3.2M × 150K) matrix. Multiply is ~0.52s for all 150K generators. Breakeven ~10,750 generators — hence `CONV_SPARSE_MIN_GENERATORS=5000` as conservative threshold.
+
+**Known issue**: Even with sparse path enabled, OOM still occurs on VGGNet specs 15-17. The dense materialization causing OOM is likely in `transform_star`, `prefilter`, or LP solver — not in `update_zono`. Needs further investigation.
+
+**VGGNet performance regression**: Sparse path causes 10x+ slowdown on specs 11/13 (114s→timeout) despite those specs having identical generator counts to specs 15-17. Root cause not yet determined.
+
 ### Settings
 
 ```python
@@ -171,11 +189,21 @@ from nnenum.settings import Settings
 # Enable logging to see batching statistics
 Settings.LOG_CONV_BATCHING = True
 
-# Adjust sparsity threshold (default: 0.05 = 5%)
+# Adjust sparsity threshold (default: 0.05 = 5%) — used for BOTH batching and sparse conv switching
 Settings.CONV_BATCHING_MIN_SPARSITY = 0.02  # More aggressive
 
 # Only batch first conv layer (for very deep networks)
 Settings.CONV_BATCHING_FIRST_LAYER_ONLY = True
+
+# Minimum generators to use sparse conv matrix path (default: 5000)
+Settings.CONV_SPARSE_MIN_GENERATORS = 5000
+
+# Memory budget before _update_zono_sparse is used instead of densifying (default: 8.0 GB)
+Settings.MEMORY_BUDGET_GB = 8.0
+
+# Print sparse path debug info (default: False) — WARNING: output goes to worker subprocesses,
+# not captured by benchmark harness. Must run directly via python3 -m nnenum.nnenum to see it.
+Settings.SPARSE_DEBUG = False
 ```
 
 **Recommendation**: Use defaults. The adaptive sparsity check handles most cases automatically.

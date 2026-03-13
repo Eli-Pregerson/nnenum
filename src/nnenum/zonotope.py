@@ -5,6 +5,7 @@ Stanley Bak
 '''
 
 import numpy as np
+from scipy.sparse import issparse
 
 from nnenum.util import Freezable
 from nnenum.timerutil import Timers
@@ -60,7 +61,8 @@ class Zonotope(Freezable):
             assert init_bounds is not None
         else:
             assert len(gen_mat_t.shape) == 2, f"expected 2-d gen_mat_t, got {gen_mat_t.shape}"
-            assert isinstance(gen_mat_t, np.ndarray), f"gen_mat_t was {type(gen_mat_t)}"
+            assert isinstance(gen_mat_t, np.ndarray) or issparse(gen_mat_t), \
+                f"gen_mat_t was {type(gen_mat_t)}"
         
             if gen_mat_t.size > 0:
                 assert len(self.center) == gen_mat_t.shape[0], f"center has {len(self.center)} dims but " + \
@@ -102,7 +104,8 @@ class Zonotope(Freezable):
     def deep_copy(self):
         'return a deep copy of this zonotope'
 
-        return Zonotope(self.center.copy(), self.mat_t.copy(), self.init_bounds.copy())
+        mat_copy = self.mat_t.copy() if not issparse(self.mat_t) else self.mat_t.copy()
+        return Zonotope(self.center.copy(), mat_copy, self.init_bounds.copy())
 
     def get_domain_center(self):
         'get the center of the domain box'
@@ -225,6 +228,40 @@ class Zonotope(Freezable):
 
         return rv
 
+    def _box_bounds_sparse(self):
+        '''Compute box bounds for a sparse mat_t without materializing the dense matrix.
+
+        O(nnz) — iterates over CSC columns (generators) and accumulates lb/ub contributions.
+        '''
+        from nnenum.settings import Settings
+
+        mat_csc = self.mat_t.tocsc()
+        lb = self.center.copy()
+        ub = self.center.copy()
+
+        for j in range(mat_csc.shape[1]):
+            col_s = mat_csc.indptr[j]
+            col_e = mat_csc.indptr[j + 1]
+            if col_s == col_e:
+                continue
+
+            row_inds = mat_csc.indices[col_s:col_e]
+            values   = mat_csc.data[col_s:col_e]
+            gen_lb, gen_ub = self.init_bounds[j]
+
+            pos_mask = values > 0
+            neg_mask = ~pos_mask
+
+            lb[row_inds[pos_mask]] += values[pos_mask] * gen_lb
+            ub[row_inds[pos_mask]] += values[pos_mask] * gen_ub
+            lb[row_inds[neg_mask]] += values[neg_mask] * gen_ub
+            ub[row_inds[neg_mask]] += values[neg_mask] * gen_lb
+
+        rv = np.empty((len(self.center), 2), dtype=self.dtype)
+        rv[:, 0] = lb
+        rv[:, 1] = ub
+        return rv
+
     def box_bounds(self):
         '''compute box bounds for the zonotope
 
@@ -233,7 +270,18 @@ class Zonotope(Freezable):
 
         Timers.tic('zono.box_bounds')
 
-        mat_t = self.mat_t
+        if issparse(self.mat_t):
+            rows, cols = self.mat_t.shape
+            dense_bytes = rows * cols * 4  # float32
+            from nnenum.settings import Settings
+            if dense_bytes > Settings.MEMORY_BUDGET_GB * 1e9:
+                rv = self._box_bounds_sparse()
+                Timers.toc('zono.box_bounds')
+                return rv
+            mat_t = self.mat_t.toarray()
+        else:
+            mat_t = self.mat_t
+
         size = self.center.size
 
         # pos_1_gens may need to be updated if matrix size changed due to assignment
@@ -254,7 +302,7 @@ class Zonotope(Freezable):
         rv = np.zeros((size, 2), dtype=self.dtype)
         rv[:, 0] = self.center + pos_neg + neg_pos
         rv[:, 1] = self.center + pos_pos + neg_neg
-        
+
         Timers.toc('zono.box_bounds')
 
         return rv
@@ -293,7 +341,28 @@ class Zonotope(Freezable):
 
         split_indices = []
 
-        if self.mat_t.size == 0:
+        from nnenum.settings import Settings
+
+        if issparse(self.mat_t):
+            rows, cols = self.mat_t.shape
+            dense_bytes = rows * cols * 4
+            if dense_bytes > Settings.MEMORY_BUDGET_GB * 1e9:
+                # Too large to densify — compute bounds for update_indices via sparse path
+                full_bounds = self._box_bounds_sparse()
+                split_indices = []
+                tol = Settings.SPLIT_TOLERANCE
+                for i in update_indices:
+                    layer_bounds[i, 0] = full_bounds[i, 0]
+                    layer_bounds[i, 1] = full_bounds[i, 1]
+                    if full_bounds[i, 0] < -tol and tol < full_bounds[i, 1]:
+                        split_indices.append(i)
+                Timers.toc('zono.update_output_bounds')
+                return np.array(split_indices, dtype=int)
+            mat_t_dense = self.mat_t.toarray()
+        else:
+            mat_t_dense = self.mat_t
+
+        if mat_t_dense.size == 0:
             # no generators
             for i in update_indices:
                 layer_bounds[i, 0] = layer_bounds[i, 1] = self.center[i]
@@ -306,7 +375,7 @@ class Zonotope(Freezable):
 
                 assert self.pos1_gens.shape[0] == self.mat_t.shape[1]
 
-            mat_t = self.mat_t[update_indices, :]
+            mat_t = mat_t_dense[update_indices, :]
 
             # is a copy here better???
 

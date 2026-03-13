@@ -18,6 +18,7 @@ from nnenum.util import Freezable, to_time_str
 from nnenum.network import nn_unflatten, nn_flatten
 
 from nnenum.prefilter import LpCanceledException
+from nnenum.lp_star_state import IntervalFallbackSafe, IntervalFallbackUnknown
 
 class Worker(Freezable):
     'local data for a worker process'
@@ -60,7 +61,8 @@ class Worker(Freezable):
 
                     # overapproximation intersection with violation can cause splits to be eliminated
                     if self.priv.ss and self.priv.ss.prefilter.output_bounds.branching_neurons.size == 0:
-                        self.priv.ss.propagate_up_to_split(self.shared.network, self.priv.start_time)
+                        self.priv.ss.propagate_up_to_split(self.shared.network, self.priv.start_time,
+                                                           spec=self.shared.spec)
 
                 if self.priv.ss and not self.has_timeout():
                     start_time = time.perf_counter()
@@ -73,6 +75,22 @@ class Worker(Freezable):
                     Timers.toc(Timers.stack[-1].name)
 
                 self.timeout()
+
+            except IntervalFallbackSafe:
+                # IBP proved this branch safe during interval collapse — discard star
+                while Timers.stack and Timers.stack[-1].name != timer_name:
+                    Timers.toc(Timers.stack[-1].name)
+
+                self.priv.ss = None
+                self.priv.finished_approx_stars += 1
+
+            except IntervalFallbackUnknown:
+                # Star too large to analyze, IBP inconclusive — discard without proof
+                # Result remains inconclusive (timeout) for this branch
+                while Timers.stack and Timers.stack[-1].name != timer_name:
+                    Timers.toc(Timers.stack[-1].name)
+
+                self.priv.ss = None
 
             # pop queue before updating shared variables so it doesn't look like there's no work if queue is nonempty
             if self.priv.ss is None:
@@ -139,6 +157,13 @@ class Worker(Freezable):
         # todo: experiment moving this after single-zono overapprox
         if do_overapprox and Settings.SPLIT_IF_IDLE and self.exists_idle_worker():
             do_overapprox = False
+
+        # Skip overapprox if star is too large for efficient overapprox rounds.
+        # With SPARSE_INTERVAL_FALLBACK, IBP will be run during propagate_up_to_split instead.
+        if do_overapprox and Settings.SPARSE_INTERVAL_FALLBACK:
+            from scipy.sparse import issparse
+            if issparse(ss.star.a_mat) and ss.star.a_mat.shape[0] > 100_000:
+                do_overapprox = False
 
         if do_overapprox:
             # todo: experiment global timeout vs per-round timeout
@@ -828,11 +853,24 @@ class Worker(Freezable):
         if not ss.is_finished(network):
             new_star = ss.do_first_relu_split(network, spec, self.priv.start_time)
 
-            ss.propagate_up_to_split(network, self.priv.start_time)
+            try:
+                ss.propagate_up_to_split(network, self.priv.start_time, spec=spec)
+            except IntervalFallbackSafe:
+                self.priv.ss = None
+                self.priv.finished_approx_stars += 1
+            except IntervalFallbackUnknown:
+                self.priv.ss = None  # inconclusive, discard without proof
 
             if new_star: # new_star can be null if it wasn't really a split (copy prefilter)
-                new_star.propagate_up_to_split(network, self.priv.start_time)
+                try:
+                    new_star.propagate_up_to_split(network, self.priv.start_time, spec=spec)
+                except IntervalFallbackSafe:
+                    new_star = None  # proved safe, discard
+                    self.priv.finished_approx_stars += 1
+                except IntervalFallbackUnknown:
+                    new_star = None  # inconclusive, discard without proof
 
+            if new_star:
                 # note: new_star may be done... but for expected branching order we still add it
                 self.priv.stars_in_progress += 1
                 self.priv.work_list.append(new_star)

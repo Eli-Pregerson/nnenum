@@ -14,6 +14,12 @@ from nnenum.specification import DisjunctiveSpec
 
 from nnenum.settings import Settings
 
+class IntervalFallbackSafe(Exception):
+    'Raised when IBP proves the current branch safe during interval fallback'
+
+class IntervalFallbackUnknown(Exception):
+    'Raised when the star is too large to analyze and IBP is inconclusive — branch is skipped'
+
 class LpStarState(Freezable):
     'variables and methods associated with verification using lp star representation'
 
@@ -129,7 +135,7 @@ class LpStarState(Freezable):
 
         return self.cur_layer >= len(network.layers)
 
-    def propagate_up_to_split(self, network, start_time):
+    def propagate_up_to_split(self, network, start_time, spec=None):
         'propagate up to the next split or until we finish with the network'
 
         depth = len(self.branch_tuples)
@@ -143,13 +149,39 @@ class LpStarState(Freezable):
                     self.prefilter.init_relu_layer(self.star, layer, start_time, depth)
 
                 if self.prefilter.output_bounds.branching_neurons.size > 0:
+                    # Before breaking for a split: check if the collapse is needed soon.
+                    # If the next conv layer would OOM, collapse + IBP now instead of splitting.
+                    if (Settings.SPARSE_STAR
+                            and Settings.SPARSE_INTERVAL_FALLBACK
+                            and spec is not None):
+                        from scipy.sparse import issparse
+                        if issparse(self.star.a_mat):
+                            from nnenum.network import Convolutional2dLayer
+                            # Find the next conv layer after the current relu
+                            next_conv = None
+                            for k in range(self.cur_layer + 1, len(network.layers)):
+                                if isinstance(network.layers[k], Convolutional2dLayer):
+                                    next_conv = network.layers[k]
+                                    break
+                            if next_conv is not None and next_conv._would_exceed_memory(self.star):
+                                # Collapse now using current relu's zono bounds
+                                bounds = self.prefilter.zono.box_bounds()
+                                lb, ub = bounds[:, 0], bounds[:, 1]
+                                if Settings.TRY_IBP:
+                                    from nnenum.overapprox import try_ibp_from_bounds
+                                    if try_ibp_from_bounds(lb, ub, network, self.cur_layer, spec):
+                                        raise IntervalFallbackSafe()
+                                # IBP inconclusive — can't verify this branch within memory budget.
+                                # Raise IntervalFallbackUnknown so the caller can handle appropriately.
+                                raise IntervalFallbackUnknown()
                     break
 
                 self.next_layer()
             else:
                 # non-relu layer
-                self.apply_linear_layer(network)
-                
+                # IntervalFallbackSafe is intentionally NOT caught here — let it propagate
+                # to the caller (worker.py / enumerate.py) where it's treated as "branch safe"
+                self.apply_linear_layer(network, spec=spec)
                 self.next_layer()
 
     def next_layer(self):
@@ -160,7 +192,7 @@ class LpStarState(Freezable):
         if self.prefilter:
             self.prefilter.clear_output_bounds()
 
-    def apply_linear_layer(self, network):
+    def apply_linear_layer(self, network, spec=None):
         'apply linear transformation part of a layer'
 
         Timers.tic('starstate.apply_linear_layer')
@@ -169,6 +201,40 @@ class LpStarState(Freezable):
         assert not isinstance(layer, ReluLayer)
         assert self.star
         assert self.prefilter
+
+        # --- Sparse-to-interval fallback ---
+        from nnenum.network import Convolutional2dLayer
+        from scipy.sparse import issparse
+        if (Settings.SPARSE_STAR
+                and Settings.SPARSE_INTERVAL_FALLBACK
+                and isinstance(layer, Convolutional2dLayer)
+                and issparse(self.star.a_mat)
+                and layer._would_exceed_memory(self.star)):
+            G = self.star.a_mat.shape[1]
+            N = self.star.a_mat.shape[0]
+            if Settings.PRINT_OUTPUT:
+                print(f"[interval fallback] L{self.cur_layer}: collapsing {G} gens -> {N} interval gens",
+                      flush=True)
+            bounds = self.prefilter.zono.box_bounds()  # (N, 2), sparse-safe
+            lb, ub = bounds[:, 0], bounds[:, 1]
+
+            # Optional IBP fast-path before building the collapsed star
+            if Settings.TRY_IBP and spec is not None:
+                from nnenum.overapprox import try_ibp_from_bounds
+                if try_ibp_from_bounds(lb, ub, network, self.cur_layer, spec):
+                    if Settings.PRINT_OUTPUT:
+                        print(f"[interval fallback] IBP proved safe at L{self.cur_layer}", flush=True)
+                    Timers.toc('starstate.apply_linear_layer')
+                    raise IntervalFallbackSafe()
+
+            self.star.collapse_to_interval_star_from_bounds(lb, ub)
+            N_new = self.star.a_mat.shape[1]
+            self.prefilter.zono.mat_t = self.star.a_mat
+            self.prefilter.zono.center = self.star.bias
+            self.prefilter.zono.init_bounds = [(-1.0, 1.0)] * N_new
+            self.prefilter.zono.init_bounds_nparray = None
+            self.prefilter.zono.pos1_gens = None
+            self.prefilter.zono.neg1_gens = None
 
         layer.transform_star(self.star)
 
@@ -227,7 +293,7 @@ class LpStarState(Freezable):
             neg, pos = self, child
         
         ### ADD INITIAL STATE INTERSECTION
-        row = self.star.a_mat[i]
+        row = self.star.get_row(i)
         bias = self.star.bias[i]
         
         # pos gets output >= 0
@@ -237,7 +303,7 @@ class LpStarState(Freezable):
         # checking feasibility doesn't add too much time as it's done again layer for witnesses
         if self_gets_positive:
             neg.star.lpi.add_dense_row(row, -bias)
-            neg.star.a_mat[i] = 0
+            neg.star.set_row_zero(i)
             neg.star.bias[i] = 0 # reset the current bias as well
 
             #child_feasible = neg.star.lpi.is_feasible()
@@ -266,7 +332,7 @@ class LpStarState(Freezable):
             else:
                 ### ASSIGN NEURON i OUTPUT
                 # neg has 0 output
-                neg.star.a_mat[i] = 0
+                neg.star.set_row_zero(i)
                 neg.star.bias[i] = 0 # reset the current bias as well
 
             # update branch_tuples

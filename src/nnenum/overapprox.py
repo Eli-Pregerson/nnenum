@@ -10,7 +10,92 @@ from nnenum.timerutil import Timers
 from nnenum.util import Freezable
 from nnenum.prefilter import update_bounds_lp, sort_splits
 from nnenum.specification import DisjunctiveSpec
-from nnenum.network import ReluLayer, FullyConnectedLayer, nn_flatten, nn_unflatten
+from nnenum.network import ReluLayer, FullyConnectedLayer, MatMulLayer, AddLayer, \
+    FlattenLayer, ReshapeLayer, Convolutional2dLayer, nn_flatten, nn_unflatten
+
+def try_ibp(init_box, network, spec):
+    '''Interval Bound Propagation precheck.
+
+    Propagates just two vectors (lb, ub) through the network — O(neurons) memory,
+    no generator matrix. If all output constraints are provably satisfied under the
+    interval overapproximation, returns True (proven safe). Otherwise returns False
+    (inconclusive — fall through to star enumeration).
+
+    Effective when epsilon is tiny, e.g. VGGNet specs with eps=2e-7 to 2e-5.
+    '''
+
+    init_box = np.array(init_box, dtype=np.float32)
+    lb = init_box[:, 0]
+    ub = init_box[:, 1]
+
+    for layer in network.layers:
+        if isinstance(layer, ReluLayer):
+            lb = np.maximum(0, lb)
+            ub = np.maximum(0, ub)
+        elif isinstance(layer, FullyConnectedLayer):
+            W, b = layer.weights, layer.biases
+            lb_new = np.where(W > 0, W, 0) @ lb + np.where(W < 0, W, 0) @ ub + b
+            ub_new = np.where(W > 0, W, 0) @ ub + np.where(W < 0, W, 0) @ lb + b
+            lb, ub = lb_new, ub_new
+        elif isinstance(layer, MatMulLayer):
+            W = layer.mat
+            lb_new = np.where(W > 0, W, 0) @ lb + np.where(W < 0, W, 0) @ ub
+            ub_new = np.where(W > 0, W, 0) @ ub + np.where(W < 0, W, 0) @ lb
+            lb, ub = lb_new, ub_new
+        elif isinstance(layer, AddLayer):
+            lb = lb + layer.vec.ravel()
+            ub = ub + layer.vec.ravel()
+        elif isinstance(layer, (FlattenLayer, ReshapeLayer)):
+            pass  # lb/ub stay flat vectors
+        elif isinstance(layer, Convolutional2dLayer):
+            shape = layer.get_input_shape()
+            mid = (lb + ub) / 2
+            rad = (ub - lb) / 2
+            mid_out = nn_flatten(layer.execute(nn_unflatten(mid, shape)))
+            orig_k = layer.kernels.copy()
+            orig_b = layer.biases.copy()
+            layer.kernels = np.abs(orig_k)
+            layer.biases = np.zeros_like(orig_b)
+            rad_out = nn_flatten(layer.execute(nn_unflatten(rad, shape)))
+            layer.kernels = orig_k
+            layer.biases = orig_b
+            lb = mid_out - rad_out
+            ub = mid_out + rad_out
+        # other layer types (ConstantLayer etc.) are rare; skip and stay conservative
+
+    # Check each Specification in the DisjunctiveSpec (or a single Specification).
+    # A Specification is violated if ALL rows of (mat @ output <= rhs) hold simultaneously.
+    # IBP proves a Specification cannot be violated if for at least one row,
+    # the minimum of (mat @ output) over [lb, ub] exceeds rhs — making that row impossible.
+    # Safe overall = every Specification in spec_list cannot be violated.
+    from nnenum.specification import DisjunctiveSpec, Specification
+    if isinstance(spec, DisjunctiveSpec):
+        spec_list = spec.spec_list
+    else:
+        assert isinstance(spec, Specification)
+        spec_list = [spec]
+    for single_spec in spec_list:
+        mat = single_spec.mat.astype(np.float32)
+        rhs = single_spec.rhs
+        # minimum of each row of mat @ output over [lb, ub]
+        min_vals = np.where(mat > 0, mat, 0) @ lb + np.where(mat < 0, mat, 0) @ ub
+        # if any row's min > rhs, that row can never be satisfied → spec cannot be violated
+        if not np.any(min_vals > rhs + 1e-6):
+            return False  # cannot rule out this spec being violated → inconclusive
+
+    return True  # every spec proven impossible → safe
+
+def try_ibp_from_bounds(lb, ub, network, cur_layer, spec):
+    '''Run IBP from mid-network interval bounds through remaining layers.
+
+    lb, ub: per-neuron float32 arrays at the output of layer cur_layer - 1.
+    Returns True if proven safe, False if inconclusive.
+    '''
+    import types
+    init_box = np.stack([lb, ub], axis=1)  # (N, 2)
+    partial_network = types.SimpleNamespace()
+    partial_network.layers = network.layers[cur_layer:]
+    return try_ibp(init_box, partial_network, spec)
 
 def try_quick_overapprox(ss, network, spec, start_time):
     'try a quick overapproximation, return is_safe, concrete_io_tuple'
@@ -575,12 +660,135 @@ class ZonoOverapprox(Freezable):
 
         return self.zono.mat_t.shape[1]
 
+def _update_zono_sparse(z, relu_update_func, bounds, splits, zeros):
+    '''Sparse-aware ReLU update — called when mat_t is sparse and densifying would OOM.
+
+    Operations on mat_t rows:
+      - zeros: zero out entire rows (neurons clamped to 0)
+      - splits: apply relu_update_func which modifies one row and writes one value into new_gen
+
+    Each split adds exactly one new generator column with at most one nonzero (at output_dim).
+
+    The exact per-split math (row scaling, center update, new_gen value) depends on which
+    relu_update_func is passed — the caller fills that in.  This stub handles the sparse
+    bookkeeping; the math is delegated to relu_update_func via a dense proxy row.
+    '''
+    from scipy.sparse import issparse, csc_matrix, csr_matrix, hstack as sp_hstack
+
+    center = z.center
+
+    # --- Zero rows (neurons fully clamped to 0) ---
+    center[zeros] = 0
+    if len(zeros) > 0:
+        # CSR makes row zeroing efficient: just zero the data slice for each row
+        mat_csr = z.mat_t.tocsr()
+        for row_idx in zeros:
+            s, e = mat_csr.indptr[row_idx], mat_csr.indptr[row_idx + 1]
+            mat_csr.data[s:e] = 0
+        mat_csr.eliminate_zeros()
+        z.mat_t = mat_csr.tocsc()
+
+    if splits.size == 0:
+        return
+
+    # --- Split rows: apply relu_update_func row-by-row ---
+    # Each call to relu_update_func may:
+    #   - scale gen_mat_t[output_dim] (a row)
+    #   - update center[output_dim]
+    #   - write exactly one nonzero into new_gen[output_dim]
+    #
+    # We use a dense proxy for the single row touched per split, then write it back.
+    # New generator columns are collected as (value, row_index) pairs and bulk-inserted.
+
+    mat_csc = z.mat_t.tocsc()
+    rows_total = mat_csc.shape[0]
+    G = mat_csc.shape[1]
+
+    new_gen_values = []   # (value, row_index) for each new column
+    modified_rows = {}    # row_index -> new dense row array (only for scaled rows)
+
+    class _RowProxy:
+        '''Proxy so relu_update_func can index with proxy[output_dim] as if it were a 2D matrix row.
+        proxy[output_dim] returns/sets the row_dense array, regardless of the index value.
+        This matches the 2D semantics: mat[row_index] returns the full row.
+        '''
+        __slots__ = ('_row',)
+        def __init__(self, row): self._row = row
+        def __getitem__(self, i): return self._row
+        def __setitem__(self, i, v): self._row[:] = v
+
+    for i, split_index in enumerate(splits):
+        lb, ub = bounds[split_index]
+
+        # Extract the row as a dense vector so relu_update_func can mutate it
+        row_dense = np.asarray(mat_csc.getrow(split_index).todense()).ravel().astype(z.dtype)
+        new_gen_col = np.zeros(rows_total, dtype=z.dtype)
+
+        # Pass proxy so relu_update_func sees proxy[output_dim] = full row (not a scalar)
+        proxy = _RowProxy(row_dense)
+        relu_update_func(lb, ub, int(split_index), proxy, center, new_gen_col)
+
+        # Check if the row was modified (interval zeros it; best_area scales it)
+        modified_rows[int(split_index)] = row_dense
+
+        # new_gen_col has at most one nonzero at split_index
+        val = new_gen_col[split_index]
+        if val != 0.0:
+            new_gen_values.append((val, int(split_index)))
+
+    # Rebuild mat_csc with modified rows by converting to LIL (efficient row assignment)
+    if modified_rows:
+        mat_lil = mat_csc.tolil()
+        for row_idx, row_dense in modified_rows.items():
+            mat_lil[row_idx] = row_dense
+        mat_csc = mat_lil.tocsc()
+        mat_csc.eliminate_zeros()
+
+    # Build new generator columns: each is a sparse (rows_total, 1) column
+    S = len(splits)
+    if new_gen_values:
+        col_indices = [c for c in range(len(new_gen_values))]
+        nz_rows = [r for (_, r) in new_gen_values]
+        nz_vals = [v for (v, _) in new_gen_values]
+        new_cols = csc_matrix((nz_vals, (nz_rows, col_indices)), shape=(rows_total, S), dtype=z.dtype)
+    else:
+        new_cols = csc_matrix((rows_total, S), dtype=z.dtype)
+
+    z.mat_t = sp_hstack([mat_csc, new_cols], format='csc')
+    z.init_bounds += [(-1, 1) for _ in range(S)]
+
+
 def update_zono(z, relu_update_func, bounds, splits, zeros):
     'update a zono with the current bounds'
 
     # this assumes apply_linear_map was done first, so that only ReLU processing remains
     lb_len = bounds.shape[0]
     assert len(z.center) == lb_len, "zonotope dims ({len(z.center)}) doesn't match layer_bounds {lb_len}"
+
+    from scipy.sparse import issparse, csc_matrix
+    is_sparse = issparse(z.mat_t)
+
+    if is_sparse:
+        # Phase 1: memory guard — never densify if it would exceed the memory budget.
+        rows, cols = z.mat_t.shape
+        dense_bytes = rows * cols * 4  # float32
+        budget_bytes = Settings.MEMORY_BUDGET_GB * 1e9
+
+        if Settings.SPARSE_DEBUG:
+            nnz = z.mat_t.nnz
+            density = nnz / max(rows * cols, 1)
+            print(f"[update_zono] mat_t={rows}x{cols} nnz={nnz} density={density:.4%} "
+                  f"dense_would_be={dense_bytes/1e9:.2f}GB budget={Settings.MEMORY_BUDGET_GB}GB "
+                  f"splits={len(splits)} zeros={len(zeros)}", flush=True)
+
+        if dense_bytes > budget_bytes:
+            # Cannot densify — use the sparse ReLU path
+            _update_zono_sparse(z, relu_update_func, bounds, splits, zeros)
+            return
+
+        # Phase 3: capture pre-ReLU nnz to avoid a full matrix scan after densification
+        pre_relu_nnz = z.mat_t.nnz
+        z.mat_t = z.mat_t.toarray().astype(np.float32)
 
     gen_mat_t = z.mat_t
     center = z.center
@@ -610,13 +818,25 @@ def update_zono(z, relu_update_func, bounds, splits, zeros):
 
         Timers.toc('stack_new_generators')
 
+    # Phase 3: reconvert to sparse using pre-ReLU nnz estimate (avoids O(rows*cols) count_nonzero).
+    # Row-zeroing only reduces nnz, row-scaling doesn't increase it, new_generators add len(splits)
+    # columns each with 1 nonzero — so post-ReLU nnz <= pre_relu_nnz + len(splits).
+    if is_sparse:
+        post_nnz_estimate = pre_relu_nnz + len(splits)
+        total = z.mat_t.shape[0] * z.mat_t.shape[1]
+        if total > 0 and post_nnz_estimate / total <= Settings.CONV_BATCHING_MIN_SPARSITY:
+            # Use np.nonzero for O(nnz) CSC construction rather than O(rows*cols) csc_matrix scan
+            nz_rows, nz_cols = np.nonzero(z.mat_t)
+            nz_vals = z.mat_t[nz_rows, nz_cols]
+            z.mat_t = csc_matrix((nz_vals, (nz_rows, nz_cols)), shape=z.mat_t.shape)
+
 def relu_update_interval_zono(_lb, ub, output_dim, gen_mat_t, center, new_gen):
     '''update one dimension (output) of a zonotope due to a relu split
     This function produces the interval zonotope.
     '''
 
     gen_mat_t[output_dim] = 0
-    
+
     y_offset = ub / 2.0
     center[output_dim] = y_offset
 
@@ -640,7 +860,7 @@ def relu_update_best_area_zono(lb, ub, output_dim, gen_mat_t, center, new_gen):
     assert lb < Settings.SPLIT_TOLERANCE
     assert ub > -Settings.SPLIT_TOLERANCE
 
-    slope_lambda = ub / (ub - lb) 
+    slope_lambda = ub / (ub - lb)
     gen_mat_t[output_dim] *= slope_lambda
 
     # add new generator value to bm
@@ -672,9 +892,14 @@ class DeeppolyOverapprox(Freezable):
 
         self.zono = ss.prefilter.zono.deep_copy()
 
-        self.ubcoef = np.copy(self.zono.mat_t)   # upper bounds coefficients of upper bound equations
+        # Densify mat_t if sparse — DeepPoly arithmetic assumes dense numpy arrays
+        from scipy.sparse import issparse
+        mat_t_dense = self.zono.mat_t.toarray().astype(np.float32) \
+            if issparse(self.zono.mat_t) else self.zono.mat_t
+
+        self.ubcoef = np.copy(mat_t_dense)   # upper bounds coefficients of upper bound equations
         self.ubconst = np.copy(self.zono.center) # upper bounds constants of upper bound equations
-        self.lbcoef = np.copy(self.zono.mat_t)   # lower bounds coefficients of lower bound equations
+        self.lbcoef = np.copy(mat_t_dense)   # lower bounds coefficients of lower bound equations
         self.lbconst = np.copy(self.zono.center) # lower bounds constants of lower bound equations
         self.inputbounds = np.copy(self.zono.init_bounds)    # input bounds (at this stage)
         self.ubs = np.copy(ss.prefilter.output_bounds.layer_bounds[:, 1])    # upper bounds

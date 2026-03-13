@@ -15,13 +15,13 @@ import numpy as np
 
 from nnenum.timerutil import Timers
 from nnenum.lp_star import LpStar
-from nnenum.lp_star_state import LpStarState
+from nnenum.lp_star_state import LpStarState, IntervalFallbackSafe, IntervalFallbackUnknown
 from nnenum.util import Freezable, FakeQueue, to_time_str, check_openblas_threads
 from nnenum.settings import Settings
 from nnenum.result import Result
 from nnenum.network import NeuralNetwork, nn_flatten
 from nnenum.worker import Worker
-from nnenum.overapprox import try_quick_overapprox
+from nnenum.overapprox import try_quick_overapprox, try_ibp
 
 from nnenum.prefilter import LpCanceledException
 
@@ -59,9 +59,21 @@ def make_init_ss(init, network, spec, start_time):
 
     try: # catch lp timeout
         Timers.tic('propagate_up_to_split')
-        ss.propagate_up_to_split(network, start_time)
+        ss.propagate_up_to_split(network, start_time, spec=spec)
         Timers.toc('propagate_up_to_split')
     except LpCanceledException:
+        while Timers.stack and Timers.stack[-1].name != timer_name:
+            Timers.toc(Timers.stack[-1].name)
+
+        ss = None
+    except IntervalFallbackSafe:
+        # IBP proved the initial branch safe — use 'safe' sentinel
+        while Timers.stack and Timers.stack[-1].name != timer_name:
+            Timers.toc(Timers.stack[-1].name)
+
+        ss = 'ibp_safe'
+    except IntervalFallbackUnknown:
+        # Star too large, IBP inconclusive — treat as timeout
         while Timers.stack and Timers.stack[-1].name != timer_name:
             Timers.toc(Timers.stack[-1].name)
 
@@ -105,11 +117,23 @@ def enumerate_network(init, network, spec=None):
 
     init_ss = None
     concrete_io_tuple = None
-    
+
+    # IBP precheck: runs before star construction, O(neurons) memory
+    if Settings.TRY_IBP and spec is not None and time.perf_counter() - start < Settings.TIMEOUT:
+        if try_ibp(init, network, spec):
+            if Settings.PRINT_OUTPUT:
+                print("Proven safe via IBP precheck")
+            rv = Result(network, quick=True)
+            rv.result_str = 'safe'
+            return rv
+
     if time.perf_counter() - start < Settings.TIMEOUT:
         init_ss = make_init_ss(init, network, spec, start) # returns None if timeout
 
-        proven_safe = False
+        proven_safe = (init_ss == 'ibp_safe')
+        if proven_safe:
+            init_ss = None  # no star to work with; proven_safe=True takes priority below
+
         try_quick = Settings.TRY_QUICK_OVERAPPROX or Settings.SINGLE_SET
 
         if init_ss is not None and try_quick and spec is not None:
@@ -119,24 +143,24 @@ def enumerate_network(init, network, spec=None):
         # try_quick_overapprox found error
         if Settings.PRINT_OUTPUT:
             print("Proven unsafe before enumerate")
-                
+
         rv = Result(network, quick=True)
         rv.result_str = 'unsafe'
 
         rv.cinput = concrete_io_tuple[0]
         rv.coutput = concrete_io_tuple[1]
-    elif init_ss is None or time.perf_counter() - start > Settings.TIMEOUT:
-        if Settings.PRINT_OUTPUT:
-            print(f"Timeout before enumerate, init_ss is None: {init_ss is None}")
-            
-        rv = Result(network, quick=True)
-        rv.result_str = 'timeout'
     elif proven_safe:
         if Settings.PRINT_OUTPUT:
             print("Proven safe before enumerate")
-            
+
         rv = Result(network, quick=True)
         rv.result_str = 'safe'
+    elif init_ss is None or time.perf_counter() - start > Settings.TIMEOUT:
+        if Settings.PRINT_OUTPUT:
+            print(f"Timeout before enumerate, init_ss is None: {init_ss is None}")
+
+        rv = Result(network, quick=True)
+        rv.result_str = 'timeout'
     else:
         if Settings.SINGLE_SET:
             if Settings.PRINT_OUTPUT:
@@ -279,8 +303,24 @@ def process_result(shared):
         Timers.toc('deserialize result stars')
 
     # save timers if requested
-    for timer_name, count, secs in zip(Settings.RESULT_SAVE_TIMERS, shared.timer_counts, shared.timer_secs):
-        shared.result.timers[timer_name] = (count, secs)
+    # shared.timer_secs contains worker-accumulated timers (transform_zono passes, worker star passes).
+    # The initial propagate_up_to_split in make_init_ss runs in the MAIN process and its timers
+    # live in the main process's Timers tree — never in shared.timer_secs.  We must add them here
+    # so that multi-process runs capture the full conv cost (not just worker zono passes).
+    for tindex, timer_name in enumerate(Settings.RESULT_SAVE_TIMERS):
+        worker_count = shared.timer_counts[tindex]
+        worker_secs  = shared.timer_secs[tindex]
+
+        # Accumulate any matching timers from the main-process Timers tree
+        main_count = 0
+        main_secs  = 0.0
+        if Timers.top_level_timer is not None:
+            for t in Timers.top_level_timer.get_children_recursive(timer_name):
+                main_count += t.num_calls
+                main_secs  += t.total_secs
+
+        shared.result.timers[timer_name] = (worker_count + main_count,
+                                            worker_secs + main_secs)
 
 class SharedState(Freezable):
     'shared computation state across processes'
