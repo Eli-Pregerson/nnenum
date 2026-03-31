@@ -1279,42 +1279,42 @@ class Convolutional2dLayer(Freezable):
     def _would_exceed_memory(self, star):
         '''True if propagating star.a_mat through this conv layer would exceed MEMORY_BUDGET_GB.
 
-        Estimates output nnz as: input_nnz * (kernel_h * kernel_w) since each input nonzero
-        fans out to at most kernel_size² output positions (for stride-1, same-pad conv).
+        For sparse stars, estimates output nnz = G × rf_h × rf_w × C_out where rf is the
+        current receptive field size of each generator. rf is estimated from the avg nonzeros
+        per generator column in the input a_mat.
 
-        Also fires if the current a_mat is already large enough that holding it while running
-        overapprox (which deep-copies it) would exceed half the budget — so the collapse
-        happens before the overapprox zono is created from a huge matrix.
+        Falls back to dense estimate (out_neurons × G × 4) if generators are already dense.
         '''
         from nnenum.settings import Settings
         from scipy.sparse import issparse
         if not issparse(star.a_mat):
             return False
 
-        # Check if the *current* a_mat is already too large for overapprox deep copy
-        # (overapprox deep-copies the prefilter zono which points to star.a_mat)
-        current_bytes = star.a_mat.nnz * 8  # CSR: data + col_indices
-        if current_bytes > Settings.MEMORY_BUDGET_GB * 1e9 / 2:
-            return True
+        G = star.a_mat.shape[1]
+        if G == 0:
+            return False
 
-        # Check if the conv_matrix (Toeplitz) for this layer would exceed budget.
-        # conv_matrix nnz ≈ out_size × kH × kW × C_in.
-        kh, kw = self.kernels[0][0].shape[:2]
-        c_in = len(self.kernels[0])  # number of input channels
-        out_size = int(np.prod(self.get_output_shape()))
-        conv_matrix_nnz = out_size * kh * kw * c_in
-        conv_matrix_bytes = conv_matrix_nnz * 4  # float32
-        if conv_matrix_bytes > Settings.MEMORY_BUDGET_GB * 1e9 / 2:
-            return True
+        out_h, out_w, c_out = self.get_output_shape()
+        out_neurons = out_h * out_w * c_out
 
-        # Check if *output* of this conv would exceed budget
+        # Estimate avg nnz per generator in the output.
+        # Each input nonzero fans out to at most kH × kW output rows per output channel,
+        # but since the output is spatially local, the output nnz per gen ≈ rf_h × rf_w × C_out
+        # where rf = sqrt(avg input nnz per gen / C_in).
         input_nnz = star.a_mat.nnz
-        estimated_output_nnz = input_nnz * kh * kw
-        estimated_bytes = estimated_output_nnz * 8
-        dense_bytes = out_size * star.a_mat.shape[1] * 4
-        projected_bytes = min(estimated_bytes, dense_bytes)
+        avg_nnz_per_gen = input_nnz / G  # avg nonzeros per generator column
 
-        return projected_bytes > Settings.MEMORY_BUDGET_GB * 1e9 / 2
+        kh, kw = self.kernels[0][0].shape[:2]
+        # Output nonzeros per generator: each input nonzero contributes to at most kH×kW output
+        # positions, times C_out output channels.
+        estimated_output_nnz_per_gen = avg_nnz_per_gen * kh * kw
+        # Cap at dense output size per generator
+        estimated_output_nnz_per_gen = min(estimated_output_nnz_per_gen, out_neurons)
+
+        estimated_total_nnz = estimated_output_nnz_per_gen * G
+        estimated_bytes = estimated_total_nnz * 4  # float32
+
+        return estimated_bytes > Settings.MEMORY_BUDGET_GB * 1e9
 
     def _batch_generators_for_conv(self, mat, shape):
         """

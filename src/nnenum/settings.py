@@ -84,7 +84,8 @@ class Settings(metaclass=FreezableMeta):
 
         # Maximum memory (GB) allowed for a dense mat_t materialization.
         # If .toarray() on a sparse mat_t would exceed this, take the sparse path instead.
-        cls.MEMORY_BUDGET_GB = 8.0
+        # Sized for m5.16xlarge (256 GB, 64 vCPUs): 64 × 3 = 192 GB, leaves 64 GB headroom.
+        cls.MEMORY_BUDGET_GB = 3.0
 
         # Print per-layer sparse stats (density, nnz, timing) for debugging the sparse path.
         cls.SPARSE_DEBUG = False

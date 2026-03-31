@@ -217,10 +217,18 @@ def set_vggnet_settings():
     # No-op for specs with G < CONV_SPARSE_MIN_GENERATORS (falls back to dense path).
     Settings.SPARSE_STAR = True
 
-    # When sparse a_mat would still OOM (specs 15-17: 150K gens grow to ~448GB by layer 19),
-    # collapse to per-neuron interval star and continue propagation from there.
+    # When sparse a_mat would still OOM, collapse to per-neuron interval star and continue.
     Settings.SPARSE_INTERVAL_FALLBACK = True
     Settings.TRY_IBP = True  # try IBP first from the collapsed intervals (fast, O(neurons))
+
+    # On m5.16xlarge (256 GB, 64 vCPUs): limit to 4 workers so each has ~60 GB available.
+    # VGGNet with BRANCH_OVERAPPROX is a single-path forward pass — extra workers are idle.
+    Settings.NUM_PROCESSES = 4
+
+    # Allow sparse propagation to use up to 50 GB per worker before triggering interval
+    # collapse. This propagates as many layers as possible before collapsing, giving IBP
+    # the tightest possible bounds — maximising the chance of proving spec 17.
+    Settings.MEMORY_BUDGET_GB = 50.0
 
 def set_image_settings():
     'set settings for larger image benchmarks'
