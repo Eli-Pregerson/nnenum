@@ -1,0 +1,7 @@
+benchmarks/**/*.onnx
+benchmarks/**/*.onnx.*
+benchmarks/**/*.vnnlib
+benchmarks/**/*.compiled
+counterexamples/
+out.txt
+stdout.lo
