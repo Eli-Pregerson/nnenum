@@ -1986,18 +1986,34 @@ class SkipAddLayer(Freezable):
         # Add biases
         star_main.bias = star_main.bias + star_skip.bias
 
-        # Add generator matrices element-wise (same shape — same param space)
+        # Add generator matrices element-wise.
+        # In overapprox mode, ReLU splits on the main path add new generator columns
+        # that the skip path's cached star doesn't have.  Pad skip with zero columns
+        # so shapes match — zero is correct because the skip path contributes nothing
+        # to those generators.
         if star_skip.a_mat is not None and star_main.a_mat is not None:
-            assert star_skip.a_mat.shape == star_main.a_mat.shape, (
-                f"SkipAdd a_mat shape mismatch: skip={star_skip.a_mat.shape}, "
-                f"main={star_main.a_mat.shape}")
+            n_skip = star_skip.a_mat.shape[1]
+            n_main = star_main.a_mat.shape[1]
+            if n_skip < n_main:
+                pad = np.zeros((star_skip.a_mat.shape[0], n_main - n_skip), dtype=star_skip.a_mat.dtype)
+                star_skip.a_mat = np.hstack([star_skip.a_mat, pad])
+            elif n_skip > n_main:
+                raise ValueError(
+                    f"SkipAdd: skip path has more generators ({n_skip}) than main path ({n_main}); "
+                    "this should never happen — the main path always has >= generators")
             star_main.a_mat = star_main.a_mat + star_skip.a_mat
         elif star_skip.a_mat is not None:
             star_main.a_mat = star_skip.a_mat.copy()
         # if star_skip.a_mat is None, star_main.a_mat is already correct
 
-        # init_bm / init_bias track the original basis — combine additively
+        # init_bm / init_bias track the original basis — combine additively.
+        # Same padding logic: skip's init_bm may have fewer columns than main's.
         if star_skip.init_bm is not None and star_main.init_bm is not None:
+            n_skip_bm = star_skip.init_bm.shape[1]
+            n_main_bm = star_main.init_bm.shape[1]
+            if n_skip_bm < n_main_bm:
+                pad = np.zeros((star_skip.init_bm.shape[0], n_main_bm - n_skip_bm), dtype=star_skip.init_bm.dtype)
+                star_skip.init_bm = np.hstack([star_skip.init_bm, pad])
             star_main.init_bm = star_main.init_bm + star_skip.init_bm
             star_main.init_bias = star_main.init_bias + star_skip.init_bias
 
@@ -2018,9 +2034,16 @@ class SkipAddLayer(Freezable):
 
         zono_main.center = zono_main.center + zono_skip.center
         if zono_skip.mat_t is not None and zono_main.mat_t is not None:
-            assert zono_skip.mat_t.shape == zono_main.mat_t.shape, (
-                f"SkipAdd zono mat_t shape mismatch: skip={zono_skip.mat_t.shape}, "
-                f"main={zono_main.mat_t.shape}")
+            # Same zero-padding as transform_star: the skip path's cached zonotope may
+            # have fewer generators than the main path due to ReLU splits in overapprox mode.
+            n_skip = zono_skip.mat_t.shape[1]
+            n_main = zono_main.mat_t.shape[1]
+            if n_skip < n_main:
+                pad = np.zeros((zono_skip.mat_t.shape[0], n_main - n_skip), dtype=zono_skip.mat_t.dtype)
+                zono_skip.mat_t = np.hstack([zono_skip.mat_t, pad])
+            elif n_skip > n_main:
+                raise ValueError(
+                    f"SkipAdd zono: skip path has more generators ({n_skip}) than main ({n_main})")
             zono_main.mat_t = zono_main.mat_t + zono_skip.mat_t
         elif zono_skip.mat_t is not None:
             zono_main.mat_t = zono_skip.mat_t.copy()
