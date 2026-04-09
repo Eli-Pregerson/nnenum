@@ -255,3 +255,62 @@ To identify optimization opportunities:
 - `vnncomp_scripts/` - VNN-COMP competition scripts
 - `vnncomp2025_benchmarks/` - Benchmark results and comparison data
 - `test_new_layers.py` - Layer-by-layer correctness tests
+
+## Known Issues
+
+### Skip Connection Soundness Bug (CRITICAL - Under Investigation)
+
+**Status**: Identified but not yet fixed. Being tracked on separate branch for future work.
+
+**Problem**: When using overapproximation mode (`BRANCH_OVERAPPROX`) on ResNet-style networks with skip connections, nnenum produces **unsound results** - reporting "sat" (property violated) when the actual answer is "unsat" (property holds).
+
+**Impact**: 348 mismatches vs alpha-beta-CROWN results:
+- 256 instances: nnenum=sat, abc=unsat ← **CRITICAL SOUNDNESS BUG**
+- 46 instances: nnenum=sat, abc=timeout
+- 46 instances: nnenum=sat, abc=no_result_in_file
+
+**Affected Benchmarks**:
+- cifar100_2024 (ResNet with skip connections): 171 mismatches
+- malbeware: 77 mismatches
+- relusplitter: 51 mismatches
+- metaroom_2023: 48 mismatches
+
+**Root Cause Hypothesis**: Parameter space mismatch in `SkipAddLayer.transform_star()` when combining skip and main paths.
+
+The issue occurs when:
+1. Skip path star is saved early in the network with N generators (one per input dimension)
+2. Main path undergoes ReLU splits, adding K new generator columns (N+K total generators)
+3. At SkipAddLayer, `transform_star(star_skip, star_main)` tries to add the generator matrices
+4. Assertion at [network.py:1022](src/nnenum/network.py#L1022) requires `star_skip.a_mat.shape == star_main.a_mat.shape`
+5. **Shape mismatch**: skip has (output_dim, N), main has (output_dim, N+K)
+
+**Why Unit Tests Passed**:
+- Tests in `tests/step*.py` use tiny 2-4 neuron networks
+- With tight input boxes, overapproximation produces zero ReLU splits
+- Parameter spaces remain same size → assertion passes
+- Real CIFAR100 networks: 3072 inputs, deep ResNet, many splits → shape mismatch
+
+**Temporary Workaround**:
+The code has a fallback at [overapprox.py:518-519](src/nnenum/overapprox.py#L518) that silently ignores skip connections when the skip source is unavailable:
+```python
+else:
+    # Skip source not available; leave star unchanged (unsound but graceful)
+    pass
+```
+This prevents crashes but causes **unsound under-approximation** of the reachable set.
+
+**Fix Required**:
+Proper fix requires aligning parameter spaces before addition, either by:
+1. Padding skip star with zero-columns for ReLU splits that happened on main path
+2. Restructuring skip connection handling in overapproximation to maintain common parameter space
+3. Using a different abstract domain that handles skip connections more naturally
+
+This is a significant architectural issue requiring careful design and extensive testing.
+
+**Current Status**:
+- Bug identified and documented
+- Work being done on separate branch
+- Main branch focusing on convolution performance optimizations first
+- Will return to fix this soundness issue after performance work is complete
+
+**Validation**: Use `validate_results.py` to compare nnenum vs ABC results after any changes to skip connection handling.

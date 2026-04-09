@@ -31,13 +31,25 @@ def _hwc_to_chw_permutation(h, w, c):
 class NeuralNetwork(Freezable):
     'neural network container'
 
-    def __init__(self, layers):
+    def __init__(self, layers, dag_predecessors=None):
+        '''
+        layers: list of layer objects
+        dag_predecessors: optional dict mapping layer_num -> [input_layer_nums]
+            Only needed for layers with non-sequential inputs (e.g. SkipAddLayer).
+            Sequential layers (each layer takes the output of the previous one) do not
+            need entries here.  Example: {5: [2, 4]} means layer 5 takes inputs from
+            layers 2 and 4.
+        '''
 
         assert layers, "layers should be a non-empty list"
 
         for i, layer in enumerate(layers):
             assert layer.layer_num == i, f"Layer {i} has incorrect layer num: {layer.layer_num}: {layer}"
-        
+
+        # dag_predecessors maps layer_num -> list of input layer_nums
+        # Empty dict means fully sequential network
+        self.dag_predecessors = dag_predecessors if dag_predecessors is not None else {}
+
         self.layers = layers
         self.check_io()
 
@@ -164,22 +176,40 @@ class NeuralNetwork(Freezable):
         if state.shape != self.get_input_shape():
             state = nn_unflatten(state, self.get_input_shape())
 
-        for layer in self.layers:
-            if save_branching and isinstance(layer, ReluLayer) or isinstance(layer, PoolingLayer):
+        # For DAG networks with skip connections, cache activations keyed by
+        # layer index so SkipAddLayer can fetch the skip-path activation.
+        # activation_cache[k] = state immediately before processing layer k.
+        activation_cache = {}
+
+        for layer_idx, layer in enumerate(self.layers):
+            # Cache current state before processing this layer (matches star_cache semantics)
+            if self.dag_predecessors:
+                activation_cache[layer_idx] = nn_flatten(state).copy()
+
+            if isinstance(layer, SkipAddLayer):
+                # Retrieve the skip-path activation from cache (at branch point)
+                skip_cache_key = self.dag_predecessors[layer_idx][0]
+                skip_state = activation_cache[skip_cache_key]
+                skip_state = nn_unflatten(skip_state, layer.skip_branch_shape)
+                state = layer.execute(skip_state, state)
+                if save_branching:
+                    branch_list.append([])
+            elif save_branching and (isinstance(layer, ReluLayer) or isinstance(layer, PoolingLayer)):
                 state, layer_branch_list = layer.execute(state, save_branching=True)
                 branch_list.append(layer_branch_list)
             else:
                 if save_branching:
                     branch_list.append([])
 
-                assert state.shape == layer.get_input_shape()
+                assert state.shape == layer.get_input_shape(), \
+                    f"Layer {layer_idx} ({layer.__class__.__name__}): state shape {state.shape} != input shape {layer.get_input_shape()}"
                 state = layer.execute(state)
                 assert state.shape == layer.get_output_shape()
 
         assert state.shape == self.get_output_shape()
 
         rv = (state, branch_list) if save_branching else state
-        
+
         return rv
 
     def check_io(self):
@@ -187,6 +217,11 @@ class NeuralNetwork(Freezable):
 
         for i, layer in enumerate(self.layers):
             if i == 0:
+                continue
+
+            # SkipAddLayer has two predecessors tracked in dag_predecessors; skip the
+            # simple sequential check for those layers.
+            if isinstance(layer, SkipAddLayer):
                 continue
 
             prev_output_shape = self.layers[i-1].get_output_shape()
@@ -1863,6 +1898,138 @@ class Convolutional2dLayer(Freezable):
         Timers.toc('execute Convolutional2dLayer')
 
         return output
+
+class SkipAddLayer(Freezable):
+    '''Skip-connection Add layer with two inputs (element-wise addition).
+
+    In a residual (ResNet) network an Add node merges the "main path" output
+    and the "skip path" output from an earlier layer.  Unlike every other
+    layer, this one consumes *two* star sets / zonotopes instead of one.
+
+    The API difference from standard layers:
+        execute(state1, state2)           -> state1 + state2
+        transform_star(star1, star2)      -> combined LpStar
+        transform_zono(zono1, zono2)      -> combined Zonotope
+        transform_deeppoly(dp1, dp2)      -> combined DeepPoly (not yet used)
+
+    For identity skip connections: state1 is the branch-point activation
+    (same shape as input_shape), and skip_layers=None.
+
+    For non-identity skip connections (e.g. ResNet projection shortcuts):
+    skip_layers holds the list of linear layers to apply to the branch-point
+    activation before adding. skip_branch_shape is the shape at the branch
+    point (may differ from input_shape when the skip path changes channels).
+
+    The caller is responsible for supplying both inputs in the correct order.
+    '''
+
+    def __init__(self, layer_num, input_shape, skip_layers=None, skip_branch_shape=None):
+        self.layer_num = layer_num
+        self.input_shape = input_shape
+        self.network = None  # assigned when building NeuralNetwork
+        # For non-identity skip paths: ordered list of layer objects to apply
+        # to the branch-point star/state before adding to the main path.
+        self.skip_layers = skip_layers  # None = identity
+        # Shape of the activation at the branch point (where skip diverges).
+        self.skip_branch_shape = skip_branch_shape if skip_branch_shape is not None else input_shape
+        self.freeze_attrs()
+
+    def __str__(self):
+        if self.skip_layers:
+            return f'[SkipAddLayer {self.input_shape} with {len(self.skip_layers)}-layer skip transform]'
+        return f'[SkipAddLayer {self.input_shape}]'
+
+    def get_input_shape(self):
+        return self.input_shape
+
+    def get_output_shape(self):
+        return self.input_shape
+
+    # ── concrete execution ──────────────────────────────────────────────────
+
+    def execute(self, state1, state2):
+        '''Element-wise addition of two concrete states.
+
+        state1 is the skip-path activation (at skip_branch_shape if skip_layers
+        are present; at input_shape otherwise).  state2 is the main-path output
+        at input_shape.  Returns the summed result at input_shape.
+        '''
+        if self.skip_layers:
+            for layer in self.skip_layers:
+                state1 = layer.execute(state1)
+        assert state1.shape == self.input_shape, \
+            f"state1 shape {state1.shape} != input_shape {self.input_shape}"
+        assert state2.shape == self.input_shape, \
+            f"state2 shape {state2.shape} != input_shape {self.input_shape}"
+        return state1 + state2
+
+    # ── abstract transformations ────────────────────────────────────────────
+
+    def transform_star(self, star_skip, star_main):
+        '''Combine two LpStar sets via element-wise addition.
+
+        star_skip is the star at the branch point.  If skip_layers is set,
+        those layers are applied to star_skip first (in-place) to produce the
+        transformed skip-path star.  Then the result is added to star_main.
+
+        Both stars (after skip transform) share the SAME parameter space u.
+
+        The MAIN PATH star (star_main) carries the LP with all the ReLU
+        split constraints that have been applied so far.  We modify it in-
+        place and return it; star_skip is treated as consumed.
+        '''
+        # Apply non-identity skip branch layers if present
+        if self.skip_layers:
+            for layer in self.skip_layers:
+                layer.transform_star(star_skip)
+
+        # Add biases
+        star_main.bias = star_main.bias + star_skip.bias
+
+        # Add generator matrices element-wise (same shape — same param space)
+        if star_skip.a_mat is not None and star_main.a_mat is not None:
+            assert star_skip.a_mat.shape == star_main.a_mat.shape, (
+                f"SkipAdd a_mat shape mismatch: skip={star_skip.a_mat.shape}, "
+                f"main={star_main.a_mat.shape}")
+            star_main.a_mat = star_main.a_mat + star_skip.a_mat
+        elif star_skip.a_mat is not None:
+            star_main.a_mat = star_skip.a_mat.copy()
+        # if star_skip.a_mat is None, star_main.a_mat is already correct
+
+        # init_bm / init_bias track the original basis — combine additively
+        if star_skip.init_bm is not None and star_main.init_bm is not None:
+            star_main.init_bm = star_main.init_bm + star_skip.init_bm
+            star_main.init_bias = star_main.init_bias + star_skip.init_bias
+
+        # LP stays on star_main unchanged (it holds all ReLU split constraints)
+        return star_main
+
+    def transform_zono(self, zono_skip, zono_main):
+        '''Combine two Zonotopes via element-wise addition.
+
+        If skip_layers is set, apply them to zono_skip first.
+        Both zonotopes (after skip transform) share the same generator space.
+
+        Modifies zono_main in-place and returns it.
+        '''
+        if self.skip_layers:
+            for layer in self.skip_layers:
+                layer.transform_zono(zono_skip)
+
+        zono_main.center = zono_main.center + zono_skip.center
+        if zono_skip.mat_t is not None and zono_main.mat_t is not None:
+            assert zono_skip.mat_t.shape == zono_main.mat_t.shape, (
+                f"SkipAdd zono mat_t shape mismatch: skip={zono_skip.mat_t.shape}, "
+                f"main={zono_main.mat_t.shape}")
+            zono_main.mat_t = zono_main.mat_t + zono_skip.mat_t
+        elif zono_skip.mat_t is not None:
+            zono_main.mat_t = zono_skip.mat_t.copy()
+        return zono_main
+
+    def transform_deeppoly(self, dp1, dp2):
+        'Combine two DeepPoly representations (stub – not used by current verification path)'
+        raise NotImplementedError("transform_deeppoly for SkipAddLayer not yet implemented")
+
 
 class PoolingLayer(Freezable):
     '''a 2d max/mean pooling layer (multi channel)

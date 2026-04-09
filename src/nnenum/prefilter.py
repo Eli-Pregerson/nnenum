@@ -163,11 +163,17 @@ class Prefilter(Freezable):
     'main container for prefilter data and logic'
 
     def __init__(self):
-        self.simulation = None # 2-list [input, output]        
+        self.simulation = None # 2-list [input, output]
         self.zono = None
 
         # used for prefilter_zonotope
         self.output_bounds = None
+
+        # cache of zonotopes at skip-source layers for SkipAddLayer use
+        self.zono_cache = {}
+
+        # cache of simulation outputs at each layer for SkipAddLayer use
+        self.simulation_cache = {}
 
         self.freeze_attrs()
 

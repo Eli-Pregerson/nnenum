@@ -411,10 +411,16 @@ class SharedState(Freezable):
 
         if self.multithreaded:
             ss.star.lpi.serialize()
+            # Also serialize any LpStar LPI objects cached for skip connections.
+            # These contain GLPK SwigPyObject handles that cannot be pickled.
+            for cached_star in ss.star_cache.values():
+                if cached_star is not None and cached_star.lpi is not None:
+                    if not isinstance(cached_star.lpi.lp, tuple):
+                        cached_star.lpi.serialize()
 
         self.more_work_queue.put(ss)
 
-        Timers.toc('put_queue')    
+        Timers.toc('put_queue')
 
     def get_global_queue(self, block=True, timeout=None, skip_deserialize=False):
         '''pop a starstate from the global queue
@@ -429,6 +435,11 @@ class SharedState(Freezable):
 
             if self.multithreaded and not skip_deserialize:
                 rv.star.lpi.deserialize()
+                # Deserialize any cached skip-connection LpStar LPI objects.
+                for cached_star in rv.star_cache.values():
+                    if cached_star is not None and cached_star.lpi is not None:
+                        if isinstance(cached_star.lpi.lp, tuple):
+                            cached_star.lpi.deserialize()
 
         except queue.Empty:
             rv = None

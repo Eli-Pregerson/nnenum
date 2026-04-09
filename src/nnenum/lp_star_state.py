@@ -9,7 +9,7 @@ from nnenum.lp_star import LpStar
 from nnenum.prefilter import Prefilter
 from nnenum.timerutil import Timers
 from nnenum.util import Freezable, compress_init_box
-from nnenum.network import FullyConnectedLayer, ReluLayer, FlattenLayer, AddLayer, MatMulLayer
+from nnenum.network import FullyConnectedLayer, ReluLayer, FlattenLayer, AddLayer, MatMulLayer, SkipAddLayer
 from nnenum.specification import DisjunctiveSpec
 
 from nnenum.settings import Settings
@@ -51,6 +51,13 @@ class LpStarState(Freezable):
         self.branch_tuples = []
 
         self.distance_to_unsafe = None
+
+        # star_cache[layer_num] = copy of star AFTER processing that layer.
+        # Used to provide the skip-path star when a SkipAddLayer is reached.
+        # Only layers whose layer_num appears as a skip source in the network's
+        # dag_predecessors need to be cached; we cache all linear layers for
+        # simplicity and memory overhead is small for typical ResNet depths.
+        self.star_cache = {}
 
         if uncompressed_init_box is not None:
             assert isinstance(uncompressed_init_box, np.ndarray), "init bounds should be given in a numpy array"
@@ -144,6 +151,10 @@ class LpStarState(Freezable):
             layer = network.layers[self.cur_layer]
 
             if isinstance(layer, ReluLayer):
+                # Cache before each ReLU too: a ReLU output can be a skip source
+                # for a downstream SkipAddLayer (e.g. ResNet shortcut bypasses ReLU block).
+                self._maybe_cache_star(network)
+
                 if self.prefilter.output_bounds is None:
                     # start of a relu layer
                     self.prefilter.init_relu_layer(self.star, layer, start_time, depth)
@@ -178,11 +189,22 @@ class LpStarState(Freezable):
 
                 self.next_layer()
             else:
+                # Cache the star before processing so skip-path stars are
+                # available when a SkipAddLayer is reached.
+                self._maybe_cache_star(network)
+
                 # non-relu layer
                 # IntervalFallbackSafe is intentionally NOT caught here — let it propagate
                 # to the caller (worker.py / enumerate.py) where it's treated as "branch safe"
                 self.apply_linear_layer(network, spec=spec)
                 self.next_layer()
+
+    def _maybe_cache_star(self, network):
+        '''Cache the current star (and simulation) keyed by cur_layer.
+        Always caches so skip-source stars are available when SkipAddLayer is reached.'''
+        self.star_cache[self.cur_layer] = self.star.copy()
+        if self.prefilter and self.prefilter.simulation is not None:
+            self.prefilter.simulation_cache[self.cur_layer] = self.prefilter.simulation[1].copy()
 
     def next_layer(self):
         'advance to the next layer'
@@ -237,14 +259,61 @@ class LpStarState(Freezable):
             self.prefilter.zono.neg1_gens = None
 
         layer.transform_star(self.star)
+        if isinstance(layer, SkipAddLayer):
+            # Retrieve the cached skip-path star
+            skip_source = network.dag_predecessors[self.cur_layer][0]
+            assert skip_source in self.star_cache, (
+                f"SkipAddLayer {self.cur_layer}: skip source {skip_source} "
+                f"not in star_cache (keys: {list(self.star_cache.keys())})")
+            star_skip = self.star_cache[skip_source]
+            # transform_star modifies self.star in-place and returns it
+            layer.transform_star(star_skip, self.star)
+            # update prefilter's zonotope reference
+            if self.prefilter.zono is not None:
+                # fetch cached zono for skip source and combine
+                skip_zono = self.prefilter.zono_cache.get(skip_source)
+                if skip_zono is not None:
+                    layer.transform_zono(skip_zono, self.prefilter.zono)
+                # re-bind so prefilter still sees the live zono
+                self.prefilter.zono.mat_t = self.star.a_mat
+                self.prefilter.zono.center = self.star.bias
+            # Update simulation: sim_skip_transformed + sim_current
+            # (simulation is a concrete witness point tracked for heuristics)
+            if self.prefilter.simulation is not None:
+                skip_sim = self.prefilter.simulation_cache.get(skip_source)
+                if skip_sim is not None:
+                    if layer.skip_layers:
+                        from nnenum.network import nn_unflatten, nn_flatten
+                        skip_sim_state = nn_unflatten(skip_sim, layer.skip_branch_shape)
+                        for sl in layer.skip_layers:
+                            skip_sim_state = sl.execute(skip_sim_state)
+                        skip_sim = nn_flatten(skip_sim_state)
+                    self.prefilter.simulation[1] = self.prefilter.simulation[1] + skip_sim
+            # zonotope sanity check
+            assert self.prefilter.zono.mat_t is self.star.a_mat
+            assert self.prefilter.zono.center is self.star.bias
+        else:
+            layer.transform_star(self.star)
 
-        # update zonotope shallow copy
-        self.prefilter.zono.mat_t = self.star.a_mat
-        self.prefilter.zono.center = self.star.bias
+            # update zonotope shallow copy
+            self.prefilter.zono.mat_t = self.star.a_mat
+            self.prefilter.zono.center = self.star.bias
 
-        self.prefilter.apply_linear_layer(layer, self.star)
+            # Cache the zonotope for skip connection use
+            self._maybe_cache_zono(network)
+
+            self.prefilter.apply_linear_layer(layer, self.star)
 
         Timers.toc('starstate.apply_linear_layer')
+
+    def _maybe_cache_zono(self, network):
+        '''Cache the current zonotope state keyed by cur_layer (for SkipAdd).'''
+        from nnenum.zonotope import Zonotope
+        z = self.prefilter.zono
+        if z is not None:
+            self.prefilter.zono_cache[self.cur_layer] = Zonotope(
+                z.center.copy(),
+                z.mat_t.copy() if z.mat_t is not None else None)
 
     def split_enumerate(self, i, network, spec, start_time):
         '''
@@ -269,6 +338,9 @@ class LpStarState(Freezable):
             child.safe_spec_list = self.safe_spec_list.copy()
 
         child.cur_layer = self.cur_layer
+
+        # copy star_cache so child has access to skip-path stars
+        child.star_cache = {k: v.copy() for k, v in self.star_cache.items() if v is not None}
 
         # split work among 2 children
         self.work_frac /= 2.0
@@ -347,6 +419,10 @@ class LpStarState(Freezable):
 
             assert child.prefilter.zono.mat_t is child.star.a_mat
             assert child.prefilter.zono.center is child.star.bias
+
+            # copy skip-connection caches to child's prefilter
+            child.prefilter.zono_cache = dict(self.prefilter.zono_cache)
+            child.prefilter.simulation_cache = {k: v.copy() for k, v in self.prefilter.simulation_cache.items()}
 
             Timers.toc('prefilter_split_relu')
 
