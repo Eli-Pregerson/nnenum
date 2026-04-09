@@ -512,11 +512,11 @@ class StarOverapprox(Freezable):
         'affine transformation for SkipAddLayer using cached skip-path star'
 
         star_skip = ss_init.star_cache.get(skip_cache_key)
-        if star_skip is not None:
-            layer.transform_star(star_skip, self.star)
-        else:
-            # Skip source not available; leave star unchanged (unsound but graceful)
-            pass
+        assert star_skip is not None, (
+            f"SkipAddLayer: skip source {skip_cache_key} not found in ss_init.star_cache "
+            f"(keys: {list(ss_init.star_cache.keys())}). "
+            "The skip source must be cached before the overapprox round starts.")
+        layer.transform_star(star_skip, self.star)
 
     def transform_skip_linear_from_saved(self, layer, saved_star):
         'apply SkipAdd using a star saved during this overapprox round at the skip-source layer'
@@ -615,11 +615,11 @@ class ZonoOverapprox(Freezable):
         'affine transformation for SkipAddLayer using cached skip-path zonotope'
 
         zono_skip = ss_init.prefilter.zono_cache.get(skip_cache_key)
-        if zono_skip is not None:
-            layer.transform_zono(zono_skip, self.zono)
-        else:
-            # Skip source not available; leave zono unchanged (unsound but graceful)
-            pass
+        assert zono_skip is not None, (
+            f"SkipAddLayer: skip source {skip_cache_key} not found in ss_init.prefilter.zono_cache "
+            f"(keys: {list(ss_init.prefilter.zono_cache.keys())}). "
+            "The skip source must be cached before the overapprox round starts.")
+        layer.transform_zono(zono_skip, self.zono)
 
     def transform_skip_linear_from_saved(self, layer, saved_zono):
         'apply SkipAdd using a zonotope saved during this overapprox round at the skip-source layer'
