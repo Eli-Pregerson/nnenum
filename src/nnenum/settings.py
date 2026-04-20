@@ -97,6 +97,14 @@ class Settings(metaclass=FreezableMeta):
         # Default 5000 is conservative (sparse wins clearly above this).
         cls.CONV_SPARSE_MIN_GENERATORS = 5000
 
+        # When generators are too dense for the sparse path (density > CONV_BATCHING_MIN_SPARSITY)
+        # but G is large, use prebuilt sparse W matrix (W @ mat_t) instead of im2col.
+        # This avoids allocating a large im2col intermediate buffer (e.g., 1.2 GB for 8×8 layers).
+        # The sparse-W @ dense-mat_t path has the same FLOPs but much better memory footprint.
+        # Set to np.inf to disable this path (always use dense im2col for dense generators).
+        # Breakeven depends on layer size: for 8×8 ResNet layers (~8192 neurons), ~500 generators.
+        cls.CONV_MATRIX_DENSE_GEN_THRESHOLD = 500
+
         # Allow star.a_mat to remain as a scipy sparse CSR matrix through conv layers.
         # Densification is deferred to FC/MatMul layers where W @ a_mat produces a dense result anyway.
         # Disable for small networks (no benefit, avoids any sparse overhead).

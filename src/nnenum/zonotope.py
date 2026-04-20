@@ -187,7 +187,11 @@ class Zonotope(Freezable):
         for res, row, ib in zip(res_vec, self.mat_t.transpose(), self.init_bounds):
             factor = ib[1] if res >= 0 else ib[0]
 
-            rv += factor * row
+            if np.isfinite(factor):
+                rv += factor * row
+            elif factor != 0:
+                # infinite factor: contribution is +/-inf in each element where row != 0
+                rv += np.where(row != 0, factor * np.sign(row), 0.0)
 
         Timers.toc('zonotope.maximize')
 
@@ -219,10 +223,16 @@ class Zonotope(Freezable):
             self.init_bounds_nparray = np.array(self.init_bounds, dtype=self.dtype)
 
         ib = self.init_bounds_nparray
-        
+
         res = np.where(res_vec <= 0, ib[:, 1], ib[:, 0])
 
-        rv += res.dot(res_vec)
+        # When any bound is infinite and the corresponding res_vec entry is 0,
+        # inf * 0 = nan raises FloatingPointError.  Only sum over nonzero projections.
+        nonzero = res_vec != 0.0
+        if nonzero.all():
+            rv += res.dot(res_vec)
+        else:
+            rv += (res[nonzero] * res_vec[nonzero]).sum()
 
         Timers.toc('zonotope.minimize_val')
 
@@ -294,10 +304,17 @@ class Zonotope(Freezable):
         pos_mat = np.clip(mat_t, 0, np.inf)
         neg_mat = np.clip(mat_t, -np.inf, 0)
 
-        pos_pos = np.dot(self.pos1_gens, pos_mat.T)
-        neg_neg = np.dot(self.neg1_gens, neg_mat.T)
-        pos_neg = np.dot(self.pos1_gens, neg_mat.T)
-        neg_pos = np.dot(self.neg1_gens, pos_mat.T)
+        with np.errstate(invalid='ignore'):
+            pos_pos = np.dot(self.pos1_gens, pos_mat.T)
+            neg_neg = np.dot(self.neg1_gens, neg_mat.T)
+            pos_neg = np.dot(self.pos1_gens, neg_mat.T)
+            neg_pos = np.dot(self.neg1_gens, pos_mat.T)
+
+        # nan arises from inf * 0 when init_bounds are infinite; treat as inf
+        pos_pos = np.where(np.isnan(pos_pos), np.inf, pos_pos)
+        neg_neg = np.where(np.isnan(neg_neg), -np.inf, neg_neg)
+        pos_neg = np.where(np.isnan(pos_neg), -np.inf, pos_neg)
+        neg_pos = np.where(np.isnan(neg_pos), -np.inf, neg_pos)
 
         rv = np.zeros((size, 2), dtype=self.dtype)
         rv[:, 0] = self.center + pos_neg + neg_pos

@@ -329,10 +329,13 @@ class Prefilter(Freezable):
             neg.domain_shrank(neg_star, start_time, depth)
 
             # tolerance for lp solver is about 1e-6
-            assert pos.simulation[1][i] >= -1e-3, f"pos sim for {i} was {pos.simulation[1][i]}"
+            # simulation may be None if the LP is infeasible (empty reachable set after split)
+            if pos.simulation is not None:
+                assert pos.simulation[1][i] >= -1e-3, f"pos sim for {i} was {pos.simulation[1][i]}"
 
             # neg should exactly be equal to zero, since we assigned a_mat and bias to zero
-            assert abs(neg.simulation[1][i]) <= Settings.SPLIT_TOLERANCE, f"neg sim for {i} was {neg.simulation[1][i]}"
+            if neg.simulation is not None:
+                assert abs(neg.simulation[1][i]) <= Settings.SPLIT_TOLERANCE, f"neg sim for {i} was {neg.simulation[1][i]}"
 
         return rv
 
@@ -344,7 +347,7 @@ class Prefilter(Freezable):
 
         # find new witness
         Timers.tic('witness_lp')
-        self.simulation = star.minimize_vec(None, return_io=True)
+        self.simulation = star.minimize_vec(None, return_io=True, fail_on_unsat=False)
         Timers.toc('witness_lp')
 
         if self.output_bounds.branching_neurons.size > 0:

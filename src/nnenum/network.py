@@ -50,6 +50,11 @@ class NeuralNetwork(Freezable):
         # Empty dict means fully sequential network
         self.dag_predecessors = dag_predecessors if dag_predecessors is not None else {}
 
+        # True when the network has multi-branch fan-out (BranchRestoreLayer present).
+        # star.lp overapprox is unsupported for such networks because the parameter space
+        # (LP columns) differs across paths and cannot be trivially merged at SkipAddLayer.
+        self.has_multi_branch = any(isinstance(l, BranchRestoreLayer) for l in layers)
+
         self.layers = layers
         self.check_io()
 
@@ -186,7 +191,13 @@ class NeuralNetwork(Freezable):
             if self.dag_predecessors:
                 activation_cache[layer_idx] = nn_flatten(state).copy()
 
-            if isinstance(layer, SkipAddLayer):
+            if isinstance(layer, BranchRestoreLayer):
+                # Restore state from the cached checkpoint
+                src_key = self.dag_predecessors[layer_idx][0]
+                state = nn_unflatten(activation_cache[src_key], layer.get_output_shape())
+                if save_branching:
+                    branch_list.append([])
+            elif isinstance(layer, SkipAddLayer):
                 # Retrieve the skip-path activation from cache (at branch point)
                 skip_cache_key = self.dag_predecessors[layer_idx][0]
                 skip_state = activation_cache[skip_cache_key]
@@ -219,9 +230,9 @@ class NeuralNetwork(Freezable):
             if i == 0:
                 continue
 
-            # SkipAddLayer has two predecessors tracked in dag_predecessors; skip the
-            # simple sequential check for those layers.
-            if isinstance(layer, SkipAddLayer):
+            # SkipAddLayer and BranchRestoreLayer have non-sequential inputs tracked
+            # in dag_predecessors; skip the simple sequential shape check for them.
+            if isinstance(layer, (SkipAddLayer, BranchRestoreLayer)):
                 continue
 
             prev_output_shape = self.layers[i-1].get_output_shape()
@@ -1741,6 +1752,26 @@ class Convolutional2dLayer(Freezable):
                 if dense_bytes <= Settings.MEMORY_BUDGET_GB * 1e9:
                     zono.mat_t = zono.mat_t.toarray().astype(np.float32)
                 # else: leave sparse — dense would OOM
+
+            # For large G with dense generators, use prebuilt sparse W matrix (W @ mat_t) instead
+            # of im2col — avoids allocating a large intermediate buffer (e.g., 1.2 GB for 8×8 layers).
+            G = zono.mat_t.shape[1] if not issparse(zono.mat_t) else 0
+            if (not issparse(zono.mat_t) and not self.is_transpose
+                    and G >= Settings.CONV_MATRIX_DENSE_GEN_THRESHOLD):
+                Timers.tic('transform_zono_matrix_dense')
+                if G > 0:
+                    if self.conv_matrix is None:
+                        self.conv_matrix = self._build_conv_matrix()
+                    result = self.conv_matrix @ zono.mat_t.astype(np.float32, copy=False)
+                    # scipy CSR @ dense ndarray returns a dense ndarray; sparse result needs .toarray()
+                    zono.mat_t = result.toarray() if issparse(result) else np.asarray(result)
+                multichannel_state = nn_unflatten(zono.center, shape)
+                multichannel_state = self.execute(multichannel_state)
+                zono.center = nn_flatten(multichannel_state)
+                Timers.toc('transform_zono_matrix_dense')
+                assert zono.center.size == zono.mat_t.shape[0]
+                return
+
             # Vectorized path: apply conv to all generator columns simultaneously
             Timers.tic('transform_zono_unbatched')
             if zono.mat_t.shape[1] > 0:
@@ -1899,6 +1930,50 @@ class Convolutional2dLayer(Freezable):
 
         return output
 
+class BranchRestoreLayer(Freezable):
+    '''Restore the current star/state from a cached checkpoint.
+
+    Used when the ONNX graph branches from a single input to multiple parallel
+    sub-networks (e.g. cersyve).  After one branch is processed, this layer
+    resets the flowing state back to the cached state at `source_cache_key` so
+    the next branch can start from the same point.
+
+    In execute(): network.execute() handles this specially, replacing `state`
+    with `activation_cache[dag_predecessors[layer_idx][0]]`.
+
+    In lp_star_state: apply_linear_layer() handles this specially, replacing
+    self.star (and prefilter.zono) with copies from star_cache / zono_cache.
+    '''
+
+    def __init__(self, layer_num, shape):
+        self.layer_num = layer_num
+        self.input_shape = shape
+        self.network = None
+        self.freeze_attrs()
+
+    def __str__(self):
+        return f'[BranchRestoreLayer -> {self.input_shape}]'
+
+    def get_input_shape(self):
+        return self.input_shape
+
+    def get_output_shape(self):
+        return self.input_shape
+
+    def execute(self, state):
+        # Handled specially in network.execute(); should not be called directly.
+        raise RuntimeError("BranchRestoreLayer.execute() must be handled by network.execute()")
+
+    def transform_star(self, star):
+        raise RuntimeError("BranchRestoreLayer.transform_star() must be handled by lp_star_state")
+
+    def transform_zono(self, zono):
+        raise RuntimeError("BranchRestoreLayer.transform_zono() must be handled by lp_star_state")
+
+    def transform_deeppoly(self, deeppoly):
+        raise RuntimeError("BranchRestoreLayer.transform_deeppoly() must be handled by lp_star_state")
+
+
 class SkipAddLayer(Freezable):
     '''Skip-connection Add layer with two inputs (element-wise addition).
 
@@ -1998,24 +2073,18 @@ class SkipAddLayer(Freezable):
                 pad = np.zeros((star_skip.a_mat.shape[0], n_main - n_skip), dtype=star_skip.a_mat.dtype)
                 star_skip.a_mat = np.hstack([star_skip.a_mat, pad])
             elif n_skip > n_main:
-                raise ValueError(
-                    f"SkipAdd: skip path has more generators ({n_skip}) than main path ({n_main}); "
-                    "this should never happen — the main path always has >= generators")
+                pad = np.zeros((star_main.a_mat.shape[0], n_skip - n_main), dtype=star_main.a_mat.dtype)
+                star_main.a_mat = np.hstack([star_main.a_mat, pad])
             star_main.a_mat = star_main.a_mat + star_skip.a_mat
         elif star_skip.a_mat is not None:
             star_main.a_mat = star_skip.a_mat.copy()
         # if star_skip.a_mat is None, star_main.a_mat is already correct
 
-        # init_bm / init_bias track the original basis — combine additively.
-        # Same padding logic: skip's init_bm may have fewer columns than main's.
-        if star_skip.init_bm is not None and star_main.init_bm is not None:
-            n_skip_bm = star_skip.init_bm.shape[1]
-            n_main_bm = star_main.init_bm.shape[1]
-            if n_skip_bm < n_main_bm:
-                pad = np.zeros((star_skip.init_bm.shape[0], n_main_bm - n_skip_bm), dtype=star_skip.init_bm.dtype)
-                star_skip.init_bm = np.hstack([star_skip.init_bm, pad])
-            star_main.init_bm = star_main.init_bm + star_skip.init_bm
-            star_main.init_bias = star_main.init_bias + star_skip.init_bias
+        # init_bm / init_bias track the original input-space basis for counterexample recovery.
+        # Both skip and main paths originate from the SAME input, so init_bm encodes the same
+        # mapping in both cases (u → original_input).  Do NOT add them — that would double-count
+        # the mapping and produce out-of-bounds inputs when solving for counterexamples.
+        # star_main.init_bm is already correct; nothing to do.
 
         # LP stays on star_main unchanged (it holds all ReLU split constraints)
         return star_main
@@ -2034,16 +2103,19 @@ class SkipAddLayer(Freezable):
 
         zono_main.center = zono_main.center + zono_skip.center
         if zono_skip.mat_t is not None and zono_main.mat_t is not None:
-            # Same zero-padding as transform_star: the skip path's cached zonotope may
-            # have fewer generators than the main path due to ReLU splits in overapprox mode.
             n_skip = zono_skip.mat_t.shape[1]
             n_main = zono_main.mat_t.shape[1]
             if n_skip < n_main:
                 pad = np.zeros((zono_skip.mat_t.shape[0], n_main - n_skip), dtype=zono_skip.mat_t.dtype)
                 zono_skip.mat_t = np.hstack([zono_skip.mat_t, pad])
             elif n_skip > n_main:
-                raise ValueError(
-                    f"SkipAdd zono: skip path has more generators ({n_skip}) than main ({n_main})")
+                pad = np.zeros((zono_main.mat_t.shape[0], n_skip - n_main), dtype=zono_main.mat_t.dtype)
+                zono_main.mat_t = np.hstack([zono_main.mat_t, pad])
+                # Extend init_bounds so it matches the new generator count
+                zono_main.init_bounds = zono_main.init_bounds + [(-1.0, 1.0)] * (n_skip - n_main)
+                zono_main.init_bounds_nparray = None
+                zono_main.pos1_gens = None
+                zono_main.neg1_gens = None
             zono_main.mat_t = zono_main.mat_t + zono_skip.mat_t
         elif zono_skip.mat_t is not None:
             zono_main.mat_t = zono_skip.mat_t.copy()

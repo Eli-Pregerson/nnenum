@@ -15,7 +15,7 @@ import onnxruntime as ort
 from skl2onnx.helpers.onnx_helper import enumerate_model_node_outputs, select_model_inputs_outputs
 from onnx.helper import ValueInfoProto, make_graph, make_model
 
-from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer, SkipAddLayer, ScaleLayer
+from nnenum.network import NeuralNetwork, ConstantLayer, AddLayer, FlattenLayer, ReshapeLayer, ReluLayer, MatMulLayer, FullyConnectedLayer, Convolutional2dLayer, SkipAddLayer, BranchRestoreLayer, ScaleLayer
 from nnenum.network import nn_unflatten, nn_flatten
 from nnenum.settings import Settings
 
@@ -318,6 +318,56 @@ def find_node_with_output(graph, output_name):
 
     return None
 
+def _topological_sort(graph, init_map):
+    '''Return ONNX graph nodes in topological (dependency) order.
+
+    Uses Kahn's algorithm.  Initializers are treated as already-available
+    tensors so they don't block any node.
+    '''
+    # Build adjacency: tensor -> list of nodes that consume it
+    tensor_to_consumers = {}
+    for node in graph.node:
+        for inp in node.input:
+            if inp and inp not in init_map:
+                tensor_to_consumers.setdefault(inp, []).append(node)
+
+    # Count unresolved (non-initializer) inputs per node
+    in_degree = {}
+    for node in graph.node:
+        count = sum(1 for inp in node.input if inp and inp not in init_map)
+        in_degree[id(node)] = count
+
+    # Network input tensors are "available" — they don't come from any node
+    network_inputs = set()
+    all_produced = {o for n in graph.node for o in n.output}
+    for inp_name in tensor_to_consumers:
+        if inp_name not in all_produced:
+            network_inputs.add(inp_name)
+
+    # Start with nodes whose non-initializer inputs are all network inputs
+    # (i.e., they only depend on the graph input, not on other nodes' outputs)
+    ready = []
+    for node in graph.node:
+        count = sum(1 for inp in node.input
+                    if inp and inp not in init_map and inp not in network_inputs)
+        if count == 0:
+            ready.append(node)
+
+    result = []
+    while ready:
+        node = ready.pop(0)
+        result.append(node)
+        for out in node.output:
+            for consumer in tensor_to_consumers.get(out, []):
+                in_degree[id(consumer)] -= 1
+                if in_degree[id(consumer)] == 0:
+                    ready.append(consumer)
+
+    assert len(result) == len(graph.node), (
+        f"Topological sort produced {len(result)} nodes but graph has {len(graph.node)} — cycle?")
+    return result
+
+
 def _trace_skip_branch(graph, skip_inp, tensor_to_layer, init_map, max_depth=20):
     '''Trace backward from skip_inp to find the branch-start tensor.
 
@@ -416,6 +466,8 @@ def _parse_skip_branch_nodes(nodes, init_map, branch_shape, onnx_type_float):
                 for out_c in range(num_out_ch):
                     for in_c in range(len(layer.kernels[out_c])):
                         layer.kernels[out_c][in_c] = layer.kernels[out_c][in_c] * bn_scale[out_c]
+                # kernels_array must also be updated — execute() uses it, not self.kernels
+                layer.kernels_array = layer.kernels_array * bn_scale[:, np.newaxis, np.newaxis, np.newaxis].astype(layer.kernels_array.dtype)
                 layer.biases = bn_scale * layer.biases + bn_shift
                 i += 1  # consumed the BN node
 
@@ -605,25 +657,28 @@ def load_onnx_network_optimized(filename):
     input_map = {i.name: i for i in graph.input}
     init_map = {i.name: i for i in graph.initializer}
 
-    i = input_map[network_input]
+    # Compute network input shape
+    s_node = graph.input[0].type.tensor_type.shape
+    all_dims = tuple(d.dim_value if d.dim_value != 0 else 1 for d in s_node.dim)
+    if len(all_dims) == 4:
+        network_input_shape = (all_dims[2], all_dims[3], all_dims[1])
+    elif len(all_dims) == 2:
+        network_input_shape = (all_dims[1],)
+    else:
+        network_input_shape = all_dims
 
-    # find the node which takes the input (probably node 0)
-    cur_node = find_node_with_input(graph, network_input, init_map)
-    cur_input_name = network_input
-
-    # ok! now proceed recursively
     layers = []
 
-    # Map from ONNX output tensor name to the star_cache key that holds the
-    # star AT that tensor.  key = len(layers) right after the producing layer
-    # is appended, which equals the cur_layer at which _maybe_cache_star will
-    # capture the star produced by that layer.
+    # Map from ONNX tensor name -> star_cache key (= layer index that produced this tensor)
     tensor_to_layer = {network_input: 0}
 
-    # Map from ONNX tensor name to its nnenum shape (tuple) at that tensor.
-    # Used to determine the branch-point shape when tracing non-identity skip paths.
-    # We'll populate it after computing prev_shape for the first node.
-    tensor_to_shape = {}  # filled in as we parse
+    # Map from ONNX tensor name -> the canonical (original) cache key for this tensor.
+    # BranchRestoreLayers are proxies — they restore the state but don't own a new canonical key.
+    # downstream BranchRestores should always point to the canonical key, not to a prior BranchRestore.
+    tensor_canonical_key = {network_input: 0}
+
+    # Map from ONNX tensor name -> nnenum shape at that tensor
+    tensor_to_shape = {network_input: network_input_shape}
 
     # DAG predecessors: skip_add_layer_idx -> [skip_src_cache_key, main_src_layer_idx]
     dag_predecessors = {}
@@ -632,52 +687,70 @@ def load_onnx_network_optimized(filename):
     onnx_type_float = 1
     onnx_type_int = 2
 
-    while cur_node is not None:
-        op = cur_node.op_type
+    # Process nodes in topological order so all producers are handled before consumers
+    sorted_nodes = _topological_sort(graph, init_map)
 
-        # For Add/Sub with skip connections, cur_input_name may appear at index 1
-        # instead of index 0.  Handle this before the general assertion.
-        if op in ['Add', 'Sub'] and cur_node.input[0] != cur_input_name:
-            assert cur_input_name in cur_node.input, \
-                f"cur_input_name ({cur_input_name}) not in Add node inputs {list(cur_node.input)}"
-        else:
-            assert cur_node.input[0] == cur_input_name, \
-                f"cur_node.input[0] ({cur_node.input[0]}) should be previous output " \
-                f"({cur_input_name}) in node:\n{cur_node.name}"
+    last_output_name = network_input
+    for cur_node in sorted_nodes:
+        op = cur_node.op_type
 
         layer = None
 
-        if layers:
-            prev_shape = layers[-1].get_output_shape()
+        # Determine the data input name and prev_shape for this node.
+        # For most ops the data input is input[0]; for Add/Sub it may be either.
+        if op in ['Add', 'Sub']:
+            # handled below; prev_shape set inside the Add block
+            prev_shape = None
+            data_inp = None
+        elif op == 'Reshape':
+            # input[0] is data, input[1] is shape tensor
+            data_inp = cur_node.input[0]
+            prev_shape = tensor_to_shape.get(data_inp, network_input_shape)
+        elif op == 'BatchNormalization':
+            data_inp = cur_node.input[0]
+            prev_shape = tensor_to_shape.get(data_inp, network_input_shape)
+        elif op == 'Constant':
+            prev_shape = network_input_shape  # unused for Constant
+            data_inp = None
+        elif cur_node.input:
+            data_inp = cur_node.input[0]
+            prev_shape = tensor_to_shape.get(data_inp, network_input_shape)
         else:
-            s_node = graph.input[0].type.tensor_type.shape
-            # ONNX format: (batch, channels, height, width) -> nnenum format: (height, width, channels)
-            # Extract all dimensions (treating 0 or missing as 1)
-            all_dims = tuple(d.dim_value if d.dim_value != 0 else 1 for d in s_node.dim)
+            prev_shape = network_input_shape
+            data_inp = None
 
-            if len(all_dims) == 4:
-                # Image input: (batch, channels, height, width) -> (height, width, channels)
-                prev_shape = (all_dims[2], all_dims[3], all_dims[1])
-            elif len(all_dims) == 2:
-                # Flat input: (batch, features) -> (features,)
-                prev_shape = (all_dims[1],)
-            else:
-                # Unexpected format, keep as-is (may fail later with better error message)
-                prev_shape = all_dims
-            # Record the network-input shape for skip-branch tracing
-            tensor_to_shape[cur_input_name] = prev_shape
-            
+        # Insert a BranchRestoreLayer if this node's data input is not the immediately
+        # preceding layer's output (i.e., we're starting a new DAG branch).
+        # This "rewinds" the flowing state to the cached checkpoint for data_inp.
+        if (data_inp is not None
+                and data_inp not in init_map
+                and data_inp in tensor_to_layer
+                and tensor_to_layer[data_inp] != len(layers)):
+            # Use canonical key so chained BranchRestores always point to the original source
+            restore_key = tensor_canonical_key.get(data_inp, tensor_to_layer[data_inp])
+            restore_shape = tensor_to_shape.get(data_inp, network_input_shape)
+            restore_layer_idx = len(layers)
+            restore_layer = BranchRestoreLayer(restore_layer_idx, restore_shape)
+            dag_predecessors[restore_layer_idx] = [restore_key]
+            layers.append(restore_layer)
+            # BranchRestoreLayer output tensor is data_inp (same shape, logically same state)
+            tensor_to_layer[data_inp] = restore_layer_idx
+            # Do NOT update tensor_canonical_key — it stays pointing at the original source
+            tensor_to_shape[data_inp] = restore_shape
+            last_output_name = data_inp
+
         if op in ['Add', 'Sub']:
             assert len(cur_node.input) == 2
 
             # Determine which input is the "other" (not the main path activation).
             # For standard bias Add: one input is an initializer.
-            # For skip-connection Add: both inputs are activations.
+            # For skip-connection Add: both inputs are activations (both in tensor_to_layer).
             inp0, inp1 = cur_node.input[0], cur_node.input[1]
 
             if inp0 in init_map or inp1 in init_map:
                 # Bias add: one input is an initializer (constant bias)
                 bias_inp = inp0 if inp0 in init_map else inp1
+                act_inp = inp1 if inp0 in init_map else inp0
                 init = init_map[bias_inp]
                 assert init.data_type == onnx_type_float
 
@@ -688,43 +761,43 @@ def load_onnx_network_optimized(filename):
                 if op == 'Sub':
                     b = -1 * b
 
+                prev_shape = tensor_to_shape.get(act_inp, network_input_shape)
                 layer = AddLayer(len(layers), b)
             else:
                 # Skip-connection Add: both inputs are activations.
-                # Identify which is the main-path (= cur_input_name) and which is skip.
-                if inp1 == cur_input_name:
+                # By topological order, both are already in tensor_to_layer.
+                assert inp0 in tensor_to_layer, \
+                    f"Add input '{inp0}' not yet computed (topological sort bug?)"
+                assert inp1 in tensor_to_layer, \
+                    f"Add input '{inp1}' not yet computed (topological sort bug?)"
+
+                # "Main" = whichever input is the current flowing state (last_output_name).
+                # "Skip" = the other input (fetched from cache).
+                # If neither matches, insert a BranchRestore for one of them first.
+                if inp0 == last_output_name:
+                    main_inp, skip_inp = inp0, inp1
+                elif inp1 == last_output_name:
                     main_inp, skip_inp = inp1, inp0
                 else:
+                    # Neither is the current state: restore inp0 (arbitrary choice) as main
                     main_inp, skip_inp = inp0, inp1
+                    restore_key = tensor_canonical_key.get(main_inp, tensor_to_layer[main_inp])
+                    restore_shape = tensor_to_shape.get(main_inp, network_input_shape)
+                    restore_layer_idx = len(layers)
+                    restore_layer = BranchRestoreLayer(restore_layer_idx, restore_shape)
+                    dag_predecessors[restore_layer_idx] = [restore_key]
+                    layers.append(restore_layer)
+                    tensor_to_layer[main_inp] = restore_layer_idx
+                    # Do NOT update tensor_canonical_key — stays at original source
+                    tensor_to_shape[main_inp] = restore_shape
+                    last_output_name = main_inp
 
-                skip_cache_key = tensor_to_layer.get(skip_inp)
+                skip_cache_key = tensor_canonical_key.get(skip_inp, tensor_to_layer[skip_inp])
+                prev_shape = tensor_to_shape.get(main_inp, network_input_shape)
+                layer = SkipAddLayer(len(layers), input_shape=prev_shape)
 
-                if skip_cache_key is not None:
-                    # Identity (or previously-parsed) skip: branch point star is cached.
-                    layer = SkipAddLayer(len(layers), input_shape=prev_shape)
-                else:
-                    # Non-identity skip: the skip tensor was produced by a side branch
-                    # (e.g. a 1x1 Conv+BN projection in ResNets) that was not visited by
-                    # the main-path parser.  Trace back, parse the side-branch nodes, and
-                    # fold them into SkipAddLayer.skip_layers.
-                    trace = _trace_skip_branch(graph, skip_inp, tensor_to_layer, init_map)
-                    assert trace is not None, (
-                        f"Skip-source tensor '{skip_inp}' not found in tensor_to_layer "
-                        f"and skip branch could not be traced")
-
-                    branch_start_tensor, skip_nodes = trace
-                    skip_cache_key = tensor_to_layer[branch_start_tensor]
-                    branch_shape = tensor_to_shape.get(branch_start_tensor, prev_shape)
-
-                    skip_layers = _parse_skip_branch_nodes(
-                        skip_nodes, init_map, branch_shape, onnx_type_float)
-
-                    layer = SkipAddLayer(len(layers), input_shape=prev_shape,
-                                        skip_layers=skip_layers,
-                                        skip_branch_shape=branch_shape)
-
-                # Record DAG: SkipAdd layer index -> [skip_src_cache_key, main_src_layer_idx]
-                dag_predecessors[len(layers)] = [skip_cache_key, len(layers) - 1]
+                # Record DAG: SkipAdd layer index -> [skip_src_cache_key]
+                dag_predecessors[len(layers)] = [skip_cache_key]
         elif op == 'Constant':
             # Extract constant value from node's 'value' attribute
             value_attr = None
@@ -1030,23 +1103,24 @@ def load_onnx_network_optimized(filename):
             layers.append(layer)
 
         assert len(cur_node.output) == 1, f"multiple output at onnx node {cur_node.name}"
-        cur_input_name = cur_node.output[0]
+        out_name = cur_node.output[0]
 
         # Record the star_cache key for this output tensor.
-        # star_cache[len(layers)] will hold the star AT cur_input_name when it
+        # star_cache[len(layers)] will hold the star AT out_name when it
         # is populated by _maybe_cache_star at the start of the next layer.
         # For BatchNorm (layer=None), len(layers) hasn't changed, so the BN
         # output maps to the same cache key as the preceding Conv/FC output.
-        tensor_to_layer[cur_input_name] = len(layers)
+        tensor_to_layer[out_name] = len(layers)
+        tensor_canonical_key[out_name] = len(layers)
 
-        # Track the nnenum shape at this tensor for skip-branch parsing.
+        # Track the nnenum shape at this tensor.
         if layers:
-            tensor_to_shape[cur_input_name] = layers[-1].get_output_shape()
+            tensor_to_shape[out_name] = layers[-1].get_output_shape()
 
-        cur_node = find_node_with_input(graph, cur_input_name, init_map)
+        last_output_name = out_name
 
-    assert cur_input_name == network_output, \
-        f"output without node {cur_input_name} is not network output {network_output}"
+    assert last_output_name == network_output, \
+        f"last processed output '{last_output_name}' is not network output '{network_output}'"
 
     return NeuralNetwork(layers, dag_predecessors=dag_predecessors)
 

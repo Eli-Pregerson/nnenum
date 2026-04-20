@@ -283,10 +283,9 @@ class LpStar(Freezable):
         'gets the input box bounds from witnesses'
 
         rv = []
+        dims = self.lpi.get_num_cols()
 
         if self.input_bounds_witnesses is not None:
-            dims = self.lpi.get_num_cols()
-
             assert len(self.input_bounds_witnesses) == dims, \
                 f"dims:{dims}, num witneses: {len(self.input_bounds_witnesses)}"
 
@@ -377,9 +376,16 @@ class LpStar(Freezable):
 
         while True:
             Timers.tic('lpi.minimize pre1')
-            res = self.lpi.minimize(vec)
+            res = self.lpi.minimize(vec, fail_on_unsat=False)
             num_lps += 1
             Timers.toc('lpi.minimize pre1')
+
+            if res is None:
+                # LP is infeasible — the star has no reachable states.
+                # Return an empty list (no bounds updates); infeasible stars are
+                # pruned naturally during further enumeration.
+                Timers.toc("star.update_input_box_bounds_new")
+                return []
 
             skipped_all = True
             skipped_some = False

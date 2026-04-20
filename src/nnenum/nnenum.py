@@ -394,6 +394,13 @@ def main():
         set_image_settings()
     elif "relusplitter" in settings_str:
         set_image_settings()
+    elif "cifar100" in settings_str:
+        set_image_settings()
+        # cifar100 ResNet: 3072+ generators × deep 8×8 conv layers is very expensive.
+        # A single zonotope round finishes in ~17s (vs ~70s for 3 rounds).
+        # Round 1 alone catches SAT instances; UNSAT instances will time out either way.
+        Settings.OVERAPPROX_TYPES = [['zono.area']]
+        Settings.QUICK_OVERAPPROX_TYPES = [['zono.area']]
     elif settings_str == "control":
         set_control_settings()
     elif settings_str == "image":
@@ -408,6 +415,16 @@ def main():
     # else:
     #     assert settings_str == "exact"
     #     set_exact_settings()
+
+    # Multi-branch networks (with BranchRestoreLayer) cannot use star.lp overapprox
+    # because the LP parameter space is inconsistent across branches at SkipAddLayer.
+    if network.has_multi_branch:
+        def _filter_star_lp(types_list):
+            return [[t for t in round_types if t != 'star.lp'] for round_types in types_list]
+        Settings.OVERAPPROX_TYPES = _filter_star_lp(Settings.OVERAPPROX_TYPES)
+        Settings.QUICK_OVERAPPROX_TYPES = _filter_star_lp(Settings.QUICK_OVERAPPROX_TYPES)
+        if hasattr(Settings, 'OVERAPPROX_TYPES_NEAR_ROOT'):
+            Settings.OVERAPPROX_TYPES_NEAR_ROOT = _filter_star_lp(Settings.OVERAPPROX_TYPES_NEAR_ROOT)
 
     for init_box, spec in spec_list:
         init_box = np.array(init_box, dtype=input_dtype)

@@ -11,7 +11,7 @@ from nnenum.util import Freezable
 from nnenum.prefilter import update_bounds_lp, sort_splits
 from nnenum.specification import DisjunctiveSpec
 from nnenum.network import ReluLayer, FullyConnectedLayer, MatMulLayer, AddLayer, \
-    FlattenLayer, ReshapeLayer, Convolutional2dLayer, nn_flatten, nn_unflatten, SkipAddLayer
+    FlattenLayer, ReshapeLayer, Convolutional2dLayer, nn_flatten, nn_unflatten, SkipAddLayer, BranchRestoreLayer
 
 
 def try_ibp(init_box, network, spec):
@@ -167,14 +167,25 @@ def make_prerelu_sims(ss, network):
             layer = network.layers[layer_num]
             rv[layer_num] = state
 
-            if isinstance(layer, SkipAddLayer) and network.dag_predecessors:
+            if isinstance(layer, BranchRestoreLayer) and network.dag_predecessors:
+                # Restore simulation from cache at the branch source.
+                # If the source wasn't cached (initial propagation stopped before reaching it),
+                # use a zero vector of the correct output shape as a conservative estimate.
+                src_key = network.dag_predecessors[layer_num][0]
+                src_sim = ss.prefilter.simulation_cache.get(src_key)
+                if src_sim is not None:
+                    state = src_sim.copy()
+                else:
+                    out_size = int(np.prod(layer.get_output_shape()))
+                    state = np.zeros(out_size, dtype=state.dtype)
+            elif isinstance(layer, SkipAddLayer) and network.dag_predecessors:
                 # SkipAdd: combine skip-path simulation with current (main-path) simulation
                 skip_cache_key = network.dag_predecessors[layer_num][0]
                 skip_sim = ss.prefilter.simulation_cache.get(skip_cache_key)
                 if skip_sim is not None:
                     state = state + skip_sim
                 # else: skip sim not available, leave state unchanged (conservative)
-            elif not isinstance(layer, SkipAddLayer):
+            elif not isinstance(layer, (SkipAddLayer, BranchRestoreLayer)):
                 shape = layer.get_input_shape()
                 input_tensor = nn_unflatten(state, shape).astype(ss.star.a_mat.dtype)
                 output_tensor = layer.execute(input_tensor)
@@ -461,7 +472,7 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
     skip_source_layers = set()
     for l_idx in range(layer_num, len(network.layers)):
         l = network.layers[l_idx]
-        if isinstance(l, SkipAddLayer) and l_idx in network.dag_predecessors:
+        if isinstance(l, (SkipAddLayer, BranchRestoreLayer)) and l_idx in network.dag_predecessors:
             src = network.dag_predecessors[l_idx][0]
             if src >= layer_num:
                 skip_source_layers.add(src)
@@ -517,7 +528,17 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
             # non-relu layer
             Timers.tic('transform_linear')
 
-            if isinstance(layer, SkipAddLayer) and network.dag_predecessors:
+            if isinstance(layer, BranchRestoreLayer) and network.dag_predecessors:
+                # Restore each overapprox state from the saved checkpoint.
+                src_key = network.dag_predecessors[layer_num][0]
+                saved_states = overapprox_skip_states.get(src_key)
+                for i, s in enumerate(sets):
+                    if saved_states is not None:
+                        s.restore_from_saved(saved_states[i])
+                    else:
+                        s.restore_from_cache(src_key, ss_init)
+                    check_cancel_func()
+            elif isinstance(layer, SkipAddLayer) and network.dag_predecessors:
                 # SkipAdd: combine skip-path state with current (main-path) state.
                 # Prefer states saved during this overapprox round (for skip sources
                 # that are beyond the initial propagation's stopping point).
@@ -597,17 +618,35 @@ class StarOverapprox(Freezable):
     def transform_skip_linear(self, layer, skip_cache_key, ss_init):
         'affine transformation for SkipAddLayer using cached skip-path star'
 
-        star_skip = ss_init.star_cache.get(skip_cache_key)
-        assert star_skip is not None, (
+        cached_star_skip = ss_init.star_cache.get(skip_cache_key)
+        assert cached_star_skip is not None, (
             f"SkipAddLayer: skip source {skip_cache_key} not found in ss_init.star_cache "
             f"(keys: {list(ss_init.star_cache.keys())}). "
             "The skip source must be cached before the overapprox round starts.")
+        # Deep-copy so transform_star doesn't mutate the cached object.
+        # transform_star may pad star_skip.a_mat in-place when n_skip < n_main,
+        # which would corrupt the shared cache entry used by subsequent overapprox rounds.
+        star_skip = cached_star_skip.copy()
         layer.transform_star(star_skip, self.star)
 
     def transform_skip_linear_from_saved(self, layer, saved_star):
         'apply SkipAdd using a star saved during this overapprox round at the skip-source layer'
 
         layer.transform_star(saved_star, self.star)
+
+    def restore_from_saved(self, saved_star):
+        'replace current star with a copy of saved_star (BranchRestore from overapprox round)'
+
+        self.star = saved_star.copy()
+
+    def restore_from_cache(self, src_key, ss_init):
+        'replace current star with a copy from ss_init star_cache (BranchRestore from initial prop)'
+
+        src_star = ss_init.star_cache.get(src_key)
+        assert src_star is not None, (
+            f"BranchRestoreLayer: source {src_key} not found in ss_init.star_cache "
+            f"(keys: {list(ss_init.star_cache.keys())})")
+        self.star = src_star.copy()
 
     def tighten_bounds(self, layer_bounds, split_indices, sim, check_cancel_func, depth):
         '''
@@ -700,17 +739,57 @@ class ZonoOverapprox(Freezable):
     def transform_skip_linear(self, layer, skip_cache_key, ss_init):
         'affine transformation for SkipAddLayer using cached skip-path zonotope'
 
-        zono_skip = ss_init.prefilter.zono_cache.get(skip_cache_key)
-        assert zono_skip is not None, (
-            f"SkipAddLayer: skip source {skip_cache_key} not found in ss_init.prefilter.zono_cache "
-            f"(keys: {list(ss_init.prefilter.zono_cache.keys())}). "
-            "The skip source must be cached before the overapprox round starts.")
+        cached_zono_skip = ss_init.prefilter.zono_cache.get(skip_cache_key)
+        if cached_zono_skip is not None:
+            # Deep-copy so transform_zono doesn't mutate the cached object.
+            # transform_zono may pad zono_skip.mat_t in-place when n_skip < n_main,
+            # which would corrupt the shared cache entry.
+            zono_skip = cached_zono_skip.deep_copy()
+        else:
+            # zono_cache may not have an entry if the skip source was a BranchRestoreLayer.
+            # Fall back to reconstructing from the exact star cache.
+            from nnenum.zonotope import Zonotope
+            src_star = ss_init.star_cache.get(skip_cache_key)
+            assert src_star is not None, (
+                f"SkipAddLayer: skip source {skip_cache_key} not found in ss_init.prefilter.zono_cache "
+                f"or ss_init.star_cache (zono_keys: {list(ss_init.prefilter.zono_cache.keys())}). "
+                "The skip source must be cached before the overapprox round starts.")
+            n_gens = src_star.a_mat.shape[1] if src_star.a_mat is not None else 0
+            zono_skip = Zonotope(
+                src_star.bias.copy(),
+                src_star.a_mat.copy() if src_star.a_mat is not None else None,
+                [(-1.0, 1.0)] * n_gens)
         layer.transform_zono(zono_skip, self.zono)
 
     def transform_skip_linear_from_saved(self, layer, saved_zono):
         'apply SkipAdd using a zonotope saved during this overapprox round at the skip-source layer'
 
         layer.transform_zono(saved_zono, self.zono)
+
+    def restore_from_saved(self, saved_zono):
+        'replace current zonotope with a copy of saved_zono (BranchRestore from overapprox round)'
+
+        self.zono = saved_zono.deep_copy()
+
+    def restore_from_cache(self, src_key, ss_init):
+        'replace current zonotope with a copy from ss_init zono_cache (BranchRestore from initial prop)'
+
+        src_zono = ss_init.prefilter.zono_cache.get(src_key)
+        if src_zono is not None:
+            self.zono = src_zono.deep_copy()
+        else:
+            # zono_cache may not have an entry if the layer at src_key was a BranchRestore itself.
+            # Fall back to reconstructing from star_cache.
+            from nnenum.zonotope import Zonotope
+            src_star = ss_init.star_cache.get(src_key)
+            assert src_star is not None, (
+                f"BranchRestoreLayer: source {src_key} not found in ss_init.star_cache either "
+                f"(keys: {list(ss_init.star_cache.keys())})")
+            n_gens = src_star.a_mat.shape[1] if src_star.a_mat is not None else 0
+            self.zono = Zonotope(
+                src_star.bias.copy(),
+                src_star.a_mat.copy() if src_star.a_mat is not None else None,
+                [(-1.0, 1.0)] * n_gens)
 
     def tighten_bounds(self, layer_bounds, _split_indices, _sim, _check_cancel_func, _depth):
         '''
@@ -943,11 +1022,18 @@ def relu_update_best_area_zono(lb, ub, output_dim, gen_mat_t, center, new_gen):
     assert lb < Settings.SPLIT_TOLERANCE
     assert ub > -Settings.SPLIT_TOLERANCE
 
-    slope_lambda = ub / (ub - lb)
+    denom = ub - lb
+    if denom == 0 or not np.isfinite(denom):
+        # Degenerate or unbounded case: use slope=0.5, mu=0 (maximally conservative)
+        slope_lambda = 0.5
+        mu = 0.0
+    else:
+        slope_lambda = ub / denom
+        mu = -1 * (ub * lb) / (2 * denom)
+
     gen_mat_t[output_dim] *= slope_lambda
 
     # add new generator value to bm
-    mu = -1 * (ub * lb) / (2 * (ub - lb))
     new_gen[output_dim] = mu
 
     # modify center
@@ -1088,6 +1174,12 @@ class DeeppolyOverapprox(Freezable):
         raise NotImplementedError(
             "DeepPoly overapproximation does not yet support SkipAddLayer. "
             "Use zono or star overapprox for skip connection networks.")
+
+    def restore_from_saved(self, saved_state):
+        raise NotImplementedError("DeepPoly does not yet support BranchRestoreLayer.")
+
+    def restore_from_cache(self, src_key, ss_init):
+        raise NotImplementedError("DeepPoly does not yet support BranchRestoreLayer.")
 
         # ubcoef_nl, ubconst_nl, lbcoef_nl, lbconst_nl = layer.transform_deeppoly()
 

@@ -9,7 +9,7 @@ from nnenum.lp_star import LpStar
 from nnenum.prefilter import Prefilter
 from nnenum.timerutil import Timers
 from nnenum.util import Freezable, compress_init_box
-from nnenum.network import FullyConnectedLayer, ReluLayer, FlattenLayer, AddLayer, MatMulLayer, SkipAddLayer
+from nnenum.network import FullyConnectedLayer, ReluLayer, FlattenLayer, AddLayer, MatMulLayer, SkipAddLayer, BranchRestoreLayer
 from nnenum.specification import DisjunctiveSpec
 
 from nnenum.settings import Settings
@@ -225,6 +225,10 @@ class LpStarState(Freezable):
         assert self.star
         assert self.prefilter
 
+        # Cache zonotope BEFORE applying the layer (matches star_cache semantics:
+        # star_cache[k] and zono_cache[k] both hold the state BEFORE layer k runs).
+        self._maybe_cache_zono(network)
+
         # --- Sparse-to-interval fallback ---
         from nnenum.network import Convolutional2dLayer
         from scipy.sparse import issparse
@@ -259,7 +263,43 @@ class LpStarState(Freezable):
             self.prefilter.zono.pos1_gens = None
             self.prefilter.zono.neg1_gens = None
 
-        if isinstance(layer, SkipAddLayer):
+        if isinstance(layer, BranchRestoreLayer):
+            # Restore star (and zono) from the cached checkpoint for this branch.
+            # We restore a_mat and bias (the output representation) from the cached star,
+            # but PRESERVE the current star's LP (lpi) — ReLU split constraints accumulated
+            # along the current path must not be discarded.  Discarding them would make the
+            # LP too loose, allowing spurious counterexamples (unconfirmed SAT).
+            src_key = network.dag_predecessors[self.cur_layer][0]
+            assert src_key in self.star_cache, (
+                f"BranchRestoreLayer {self.cur_layer}: source {src_key} "
+                f"not in star_cache (keys: {list(self.star_cache.keys())})")
+            cached_star = self.star_cache[src_key]
+            # Restore only the output-representation fields; keep current LP constraints.
+            self.star.a_mat = cached_star.a_mat.copy()
+            self.star.bias = cached_star.bias.copy()
+            # init_bm / init_bias encode the original-input basis and should not change.
+            # (Both current and cached stars map the SAME original input.)
+            if self.prefilter.zono is not None:
+                # Rebuild zono from the restored star so mat_t/center are in sync.
+                # zono_cache may not exist for BranchRestore/SkipAdd-adjacent layers,
+                # so fall back to creating a fresh zono from self.star.
+                from nnenum.zonotope import Zonotope
+                src_zono = self.prefilter.zono_cache.get(src_key)
+                if src_zono is not None:
+                    init_bounds = list(src_zono.init_bounds)
+                else:
+                    # No cached zono; use [-1,1] per generator (conservative placeholder)
+                    n_gens = self.star.a_mat.shape[1] if self.star.a_mat is not None else 0
+                    init_bounds = [(-1.0, 1.0)] * n_gens
+                self.prefilter.zono = Zonotope(
+                    self.star.bias,   # share center with star (same array → is check passes)
+                    self.star.a_mat,  # share mat_t with star (same array → is check passes)
+                    init_bounds)
+            if self.prefilter.simulation is not None:
+                src_sim = self.prefilter.simulation_cache.get(src_key)
+                if src_sim is not None:
+                    self.prefilter.simulation[1] = src_sim.copy()
+        elif isinstance(layer, SkipAddLayer):
             # Retrieve the cached skip-path star
             skip_source = network.dag_predecessors[self.cur_layer][0]
             assert skip_source in self.star_cache, (
@@ -270,9 +310,26 @@ class LpStarState(Freezable):
             layer.transform_star(star_skip, self.star)
             # update prefilter's zonotope reference
             if self.prefilter.zono is not None:
+                from nnenum.zonotope import Zonotope
                 # fetch cached zono for skip source and combine
-                skip_zono = self.prefilter.zono_cache.get(skip_source)
+                cached_skip_zono = self.prefilter.zono_cache.get(skip_source)
+                # Deep-copy so transform_zono doesn't mutate the cached object
+                # (the cache is shared via shallow dict copy between split siblings).
+                skip_zono = cached_skip_zono.deep_copy() if cached_skip_zono is not None else None
                 if skip_zono is not None:
+                    # Build fresh main zono from the current star (after transform_star), then combine.
+                    n_gens = self.star.a_mat.shape[1]
+                    n_old = len(self.prefilter.zono.init_bounds)
+                    if n_gens != n_old:
+                        # transform_star grew a_mat (n_skip > n_main); extend init_bounds
+                        self.prefilter.zono.init_bounds = self.prefilter.zono.init_bounds + \
+                            [(-1.0, 1.0)] * (n_gens - n_old)
+                        self.prefilter.zono.init_bounds_nparray = None
+                        self.prefilter.zono.pos1_gens = None
+                        self.prefilter.zono.neg1_gens = None
+                    # Re-bind mat_t and center before running transform_zono
+                    self.prefilter.zono.mat_t = self.star.a_mat
+                    self.prefilter.zono.center = self.star.bias
                     layer.transform_zono(skip_zono, self.prefilter.zono)
                 # re-bind so prefilter still sees the live zono
                 self.prefilter.zono.mat_t = self.star.a_mat
@@ -299,9 +356,6 @@ class LpStarState(Freezable):
             self.prefilter.zono.mat_t = self.star.a_mat
             self.prefilter.zono.center = self.star.bias
 
-            # Cache the zonotope for skip connection use
-            self._maybe_cache_zono(network)
-
             self.prefilter.apply_linear_layer(layer, self.star)
 
         Timers.toc('starstate.apply_linear_layer')
@@ -313,7 +367,8 @@ class LpStarState(Freezable):
         if z is not None:
             self.prefilter.zono_cache[self.cur_layer] = Zonotope(
                 z.center.copy(),
-                z.mat_t.copy() if z.mat_t is not None else None)
+                z.mat_t.copy() if z.mat_t is not None else None,
+                z.init_bounds.copy())
 
     def split_enumerate(self, i, network, spec, start_time):
         '''
