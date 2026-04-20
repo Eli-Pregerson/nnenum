@@ -40,6 +40,15 @@ class NeuralNetwork(Freezable):
             need entries here.  Example: {5: [2, 4]} means layer 5 takes inputs from
             layers 2 and 4.
         '''
+    def __init__(self, layers, dag_predecessors=None):
+        '''
+        layers: list of layer objects
+        dag_predecessors: optional dict mapping layer_num -> [input_layer_nums]
+            Only needed for layers with non-sequential inputs (e.g. SkipAddLayer).
+            Sequential layers (each layer takes the output of the previous one) do not
+            need entries here.  Example: {5: [2, 4]} means layer 5 takes inputs from
+            layers 2 and 4.
+        '''
 
         assert layers, "layers should be a non-empty list"
 
@@ -178,6 +187,7 @@ class NeuralNetwork(Freezable):
 
         state = input_vec.copy() # test with float32 dtype?
 
+
         if state.shape != self.get_input_shape():
             state = nn_unflatten(state, self.get_input_shape())
 
@@ -214,12 +224,15 @@ class NeuralNetwork(Freezable):
 
                 assert state.shape == layer.get_input_shape(), \
                     f"Layer {layer_idx} ({layer.__class__.__name__}): state shape {state.shape} != input shape {layer.get_input_shape()}"
+                assert state.shape == layer.get_input_shape(), \
+                    f"Layer {layer_idx} ({layer.__class__.__name__}): state shape {state.shape} != input shape {layer.get_input_shape()}"
                 state = layer.execute(state)
                 assert state.shape == layer.get_output_shape()
 
         assert state.shape == self.get_output_shape()
 
         rv = (state, branch_list) if save_branching else state
+
 
         return rv
 

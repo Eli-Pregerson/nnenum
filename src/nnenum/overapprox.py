@@ -164,6 +164,7 @@ def make_prerelu_sims(ss, network):
         while layer_num + 1 < len(network.layers):
             layer_num += 1
 
+
             layer = network.layers[layer_num]
             rv[layer_num] = state
 
@@ -484,8 +485,13 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
     # run remaining layers with newly-computed bounds
     remaining_layers = network.layers[layer_num:]
 
+
     for layer_index, layer in enumerate(remaining_layers):
         check_cancel_func()
+
+        # Save overapprox state BEFORE processing this layer if it is a skip source.
+        if layer_num in skip_source_layers:
+            overapprox_skip_states[layer_num] = [s.get_skip_state_copy() for s in sets]
 
         # Save overapprox state BEFORE processing this layer if it is a skip source.
         if layer_num in skip_source_layers:
@@ -498,7 +504,9 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
             if isinstance(sets[0], ZonoOverapprox):
                 extra = f' (zono shape: {sets[0].zono.mat_t.shape})'
 
+
             print(f"Layer {layer_index + 1}/{len(remaining_layers)}: {type(layer).__name__}{extra}...", end='', flush=True)
+
 
         if isinstance(layer, ReluLayer):
             sim = None if prerelu_sims is None else prerelu_sims[layer_num]
@@ -518,6 +526,7 @@ def run_overapprox_round(network, ss_init, sets, prerelu_sims, check_cancel_func
             # bounds are now as tight as they will get
             if split_indices is None:
                 split_indices = make_split_indices(layer_bounds)
+
 
             split_indices = sort_splits(layer_bounds, split_indices)
             zero_indices = np.nonzero(layer_bounds[:, 1] < -Settings.SPLIT_TOLERANCE)[0]

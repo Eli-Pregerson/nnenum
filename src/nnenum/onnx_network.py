@@ -284,7 +284,40 @@ def find_node_with_input(graph, input_name, init_map=None):
     '''
 
     candidates = []
+def find_node_with_input(graph, input_name, init_map=None):
+    '''Find the next node on the main path that accepts input_name.
+
+    For skip connections, a tensor can be consumed by two nodes: the main-path
+    next node AND the skip-merge Add node.  When multiple consumers exist we
+    return the non-skip-merge node (the main-path continuation).  A skip-merge
+    Add is an Add node where BOTH inputs are activations (neither is an
+    initializer).
+    '''
+
+    candidates = []
     for n in graph.node:
+        if input_name in n.input:
+            candidates.append(n)
+
+    if len(candidates) == 0:
+        return None
+    elif len(candidates) == 1:
+        return candidates[0]
+    else:
+        # Multiple consumers: skip-connection case.
+        # Filter out skip-merge Add nodes (Add where both inputs are activations).
+        def is_skip_merge_add(n):
+            return (n.op_type == 'Add' and
+                    init_map is not None and
+                    all(inp not in init_map for inp in n.input))
+
+        non_merge = [n for n in candidates if not is_skip_merge_add(n)]
+        if len(non_merge) == 1:
+            return non_merge[0]
+        # If still ambiguous, fall back to first candidate (may error later)
+        assert len(non_merge) > 0, \
+            f"all consumers of '{input_name}' are skip-merge Adds — cannot determine main path"
+        return non_merge[0]
         if input_name in n.input:
             candidates.append(n)
 
@@ -640,6 +673,10 @@ def load_onnx_network_optimized(filename):
     for i in set(all_input_names):  # Use set to avoid checking duplicates
         if i and i not in all_initializer_names and i not in all_output_names:  # Skip empty strings
             assert network_input is None, f"multiple onnx network inputs {network_input} and {i}"
+
+    for i in set(all_input_names):  # Use set to avoid checking duplicates
+        if i and i not in all_initializer_names and i not in all_output_names:  # Skip empty strings
+            assert network_input is None, f"multiple onnx network inputs {network_input} and {i}"
             network_input = i
 
     assert network_input, "did not find onnx network input"
@@ -757,7 +794,12 @@ def load_onnx_network_optimized(filename):
                 b = np.frombuffer(init.raw_data, dtype='<f4')
                 shape = tuple(d for d in init.dims)
                 b = nn_unflatten(b, shape, order='F')
+                b = np.frombuffer(init.raw_data, dtype='<f4')
+                shape = tuple(d for d in init.dims)
+                b = nn_unflatten(b, shape, order='F')
 
+                if op == 'Sub':
+                    b = -1 * b
                 if op == 'Sub':
                     b = -1 * b
 
@@ -1122,6 +1164,7 @@ def load_onnx_network_optimized(filename):
     assert last_output_name == network_output, \
         f"last processed output '{last_output_name}' is not network output '{network_output}'"
 
+    return NeuralNetwork(layers, dag_predecessors=dag_predecessors)
     return NeuralNetwork(layers, dag_predecessors=dag_predecessors)
 
 def stan_select_model_inputs_outputs(model, dtype, inputs, outputs, io_shapes):

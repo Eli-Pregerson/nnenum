@@ -59,6 +59,13 @@ class LpStarState(Freezable):
         # simplicity and memory overhead is small for typical ResNet depths.
         self.star_cache = {}
 
+        # star_cache[layer_num] = copy of star AFTER processing that layer.
+        # Used to provide the skip-path star when a SkipAddLayer is reached.
+        # Only layers whose layer_num appears as a skip source in the network's
+        # dag_predecessors need to be cached; we cache all linear layers for
+        # simplicity and memory overhead is small for typical ResNet depths.
+        self.star_cache = {}
+
         if uncompressed_init_box is not None:
             assert isinstance(uncompressed_init_box, np.ndarray), "init bounds should be given in a numpy array"
             assert uncompressed_init_box.dtype in [np.float32, np.float64], \
@@ -155,6 +162,10 @@ class LpStarState(Freezable):
                 # for a downstream SkipAddLayer (e.g. ResNet shortcut bypasses ReLU block).
                 self._maybe_cache_star(network)
 
+                # Cache before each ReLU too: a ReLU output can be a skip source
+                # for a downstream SkipAddLayer (e.g. ResNet shortcut bypasses ReLU block).
+                self._maybe_cache_star(network)
+
                 if self.prefilter.output_bounds is None:
                     # start of a relu layer
                     self.prefilter.init_relu_layer(self.star, layer, start_time, depth)
@@ -193,12 +204,23 @@ class LpStarState(Freezable):
                 # available when a SkipAddLayer is reached.
                 self._maybe_cache_star(network)
 
+                # Cache the star before processing so skip-path stars are
+                # available when a SkipAddLayer is reached.
+                self._maybe_cache_star(network)
+
                 # non-relu layer
                 # IntervalFallbackSafe is intentionally NOT caught here — let it propagate
                 # to the caller (worker.py / enumerate.py) where it's treated as "branch safe"
                 self.apply_linear_layer(network, spec=spec)
 
                 self.next_layer()
+
+    def _maybe_cache_star(self, network):
+        '''Cache the current star (and simulation) keyed by cur_layer.
+        Always caches so skip-source stars are available when SkipAddLayer is reached.'''
+        self.star_cache[self.cur_layer] = self.star.copy()
+        if self.prefilter and self.prefilter.simulation is not None:
+            self.prefilter.simulation_cache[self.cur_layer] = self.prefilter.simulation[1].copy()
 
     def _maybe_cache_star(self, network):
         '''Cache the current star (and simulation) keyed by cur_layer.
@@ -357,6 +379,7 @@ class LpStarState(Freezable):
             self.prefilter.zono.center = self.star.bias
 
             self.prefilter.apply_linear_layer(layer, self.star)
+            self.prefilter.apply_linear_layer(layer, self.star)
 
         Timers.toc('starstate.apply_linear_layer')
 
@@ -393,6 +416,9 @@ class LpStarState(Freezable):
             child.safe_spec_list = self.safe_spec_list.copy()
 
         child.cur_layer = self.cur_layer
+
+        # copy star_cache so child has access to skip-path stars
+        child.star_cache = {k: v.copy() for k, v in self.star_cache.items() if v is not None}
 
         # copy star_cache so child has access to skip-path stars
         child.star_cache = {k: v.copy() for k, v in self.star_cache.items() if v is not None}
@@ -474,6 +500,10 @@ class LpStarState(Freezable):
 
             assert child.prefilter.zono.mat_t is child.star.a_mat
             assert child.prefilter.zono.center is child.star.bias
+
+            # copy skip-connection caches to child's prefilter
+            child.prefilter.zono_cache = dict(self.prefilter.zono_cache)
+            child.prefilter.simulation_cache = {k: v.copy() for k, v in self.prefilter.simulation_cache.items()}
 
             # copy skip-connection caches to child's prefilter
             child.prefilter.zono_cache = dict(self.prefilter.zono_cache)
